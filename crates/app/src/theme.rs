@@ -1,7 +1,9 @@
 use gpui::{Hsla, Rgba, WindowAppearance, hsla, rgb};
 
+use crate::file_types::FileType;
 use crate::model::Item;
 use crate::sunburst::Segment;
+use crate::treemap::{Kind as TileKind, Tile};
 
 /// Hues for the top-level slices, in order of size. Neighbours are far apart on the wheel.
 const HUES: [f32; 10] = [0.58, 0.07, 0.37, 0.97, 0.75, 0.13, 0.49, 0.88, 0.28, 0.66];
@@ -110,6 +112,82 @@ impl Theme {
                 hsla(hue, saturation, (lightness + lift).min(0.92), 1.0)
             }
         }
+    }
+
+    /// Color of a treemap rectangle. Files are colored by kind; folders are neutral and get a
+    /// little darker (or lighter, in dark appearance) with every level.
+    pub fn tile(&self, tile: &Tile, hovered: bool) -> Hsla {
+        let lift = if hovered { 0.08 } else { 0.0 };
+        let depth = f32::from(tile.depth.min(8));
+        let (hue, mut saturation, mut lightness) = match tile.kind {
+            TileKind::Folder if self.dark => (0.62, 0.06, 0.17 + depth * 0.03),
+            TileKind::Folder => (0.62, 0.06, 0.93 - depth * 0.035),
+            TileKind::Accounting => (0.62, 0.06, if self.dark { 0.36 } else { 0.70 }),
+            TileKind::Smaller => (0.62, 0.05, if self.dark { 0.30 } else { 0.78 }),
+            TileKind::File(kind) => match file_type_hue(kind) {
+                Some(hue) => (hue, 0.55, if self.dark { 0.48 } else { 0.60 }),
+                None => (0.62, 0.04, if self.dark { 0.42 } else { 0.68 }),
+            },
+        };
+        if !tile.settled {
+            saturation *= 0.3;
+            lightness += 0.05;
+        }
+        hsla(hue, saturation, (lightness + lift).min(0.95), 1.0)
+    }
+
+    /// Swatch color for a file kind in the treemap legend.
+    pub fn file_type(&self, kind: FileType) -> Hsla {
+        self.tile(
+            &Tile {
+                item: Item::NotMeasured,
+                rect: crate::treemap::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                },
+                depth: 1,
+                kind: TileKind::File(kind),
+                size: 0,
+                settled: true,
+                header: false,
+            },
+            false,
+        )
+    }
+}
+
+fn file_type_hue(kind: FileType) -> Option<f32> {
+    Some(match kind {
+        FileType::Video => 0.97,
+        FileType::Image => 0.13,
+        FileType::Audio => 0.80,
+        FileType::Document => 0.58,
+        FileType::Archive => 0.06,
+        FileType::App => 0.37,
+        FileType::Code => 0.49,
+        FileType::Developer => 0.69,
+        FileType::Other => return None,
+    })
+}
+
+/// Black or white, whichever reads better on `background`.
+pub fn ink_on(background: Hsla) -> Hsla {
+    let rgba = Rgba::from(background);
+    let channel = |c: f32| {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b);
+    // Equal contrast against black and white is at a luminance of about 0.18.
+    if luminance > 0.18 {
+        hsla(0.0, 0.0, 0.08, 1.0)
+    } else {
+        hsla(0.0, 0.0, 1.0, 1.0)
     }
 }
 

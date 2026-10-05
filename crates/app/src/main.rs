@@ -1,5 +1,7 @@
 mod about;
 mod access;
+mod compare;
+mod file_types;
 mod format;
 mod model;
 mod preferences;
@@ -7,6 +9,7 @@ mod settings;
 mod storage_view;
 mod sunburst;
 mod theme;
+mod treemap;
 mod welcome;
 mod widgets;
 
@@ -22,7 +25,7 @@ use tracing_subscriber::prelude::*;
 
 use crate::about::About;
 use crate::preferences::Preferences;
-use crate::settings::Settings;
+use crate::settings::{Chart, Settings};
 use crate::storage_view::{
     AddToBasket, Dismiss, EmptyBasket, GoToTop, GoUp, OpenSelected, QuickLook, Rescan,
     RevealInFinder, ReviewBasket, ScanFolder, ScanHomeFolder, ScanStartupDisk, Scope, SelectNext,
@@ -35,7 +38,17 @@ const APP_NAME: &str = "Mac Storage Cleaner";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-actions!(app, [Quit, ShowAbout, ShowSettings, ToggleCrashReports]);
+actions!(
+    app,
+    [
+        Quit,
+        ShowAbout,
+        ShowSettings,
+        ToggleCrashReports,
+        ShowSunburst,
+        ShowTreemap
+    ]
+);
 
 /// The Settings and About windows, so each opens at most once.
 #[derive(Default)]
@@ -52,6 +65,7 @@ fn main() {
         dsn: option_env!("SENTRY_DSN"),
         release: format!("{APP_ID}@{VERSION}"),
         enabled: settings.crash_reports,
+        crash_file: settings::data_dir().map(|dir| dir.join("native-crash.bin")),
     });
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -89,7 +103,7 @@ fn main() {
 
 /// Settings, app-wide actions, key bindings and menus.
 fn init(settings: Settings, cx: &mut App) {
-    cx.set_menus(menus(settings.crash_reports));
+    cx.set_menus(menus(&settings));
     cx.set_global(settings);
     cx.set_global(Panels::default());
     cx.on_action(quit);
@@ -97,6 +111,12 @@ fn init(settings: Settings, cx: &mut App) {
         settings::update(cx, |settings| {
             settings.crash_reports = !settings.crash_reports
         });
+    });
+    cx.on_action(|_: &ShowSunburst, cx| {
+        settings::update(cx, |settings| settings.chart = Chart::Sunburst)
+    });
+    cx.on_action(|_: &ShowTreemap, cx| {
+        settings::update(cx, |settings| settings.chart = Chart::Treemap)
     });
     cx.on_action(|_: &ShowSettings, cx| open_settings_window(cx));
     cx.on_action(|_: &ShowAbout, cx| open_about_window(cx));
@@ -217,6 +237,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-1", ScanStartupDisk, view),
         KeyBinding::new("cmd-2", ScanHomeFolder, view),
         KeyBinding::new("cmd-o", ScanFolder, view),
+        KeyBinding::new("alt-cmd-1", ShowSunburst, None),
+        KeyBinding::new("alt-cmd-2", ShowTreemap, None),
         KeyBinding::new("cmd-backspace", AddToBasket, view),
         KeyBinding::new("cmd-b", ReviewBasket, view),
         KeyBinding::new("space", QuickLook, view),
@@ -224,13 +246,14 @@ fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-pub fn menus(crash_reports: bool) -> Vec<Menu> {
+pub fn menus(settings: &Settings) -> Vec<Menu> {
     vec![
         Menu::new(APP_NAME).items([
             MenuItem::action(format!("About {APP_NAME}"), ShowAbout),
             MenuItem::separator(),
             MenuItem::action("Settings…", ShowSettings),
-            MenuItem::action("Send Crash Reports", ToggleCrashReports).checked(crash_reports),
+            MenuItem::action("Send Crash Reports", ToggleCrashReports)
+                .checked(settings.crash_reports),
             MenuItem::separator(),
             MenuItem::action(format!("Quit {APP_NAME}"), Quit),
         ]),
@@ -241,6 +264,11 @@ pub fn menus(crash_reports: bool) -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Rescan", Rescan),
             MenuItem::action("Stop Scan", StopScan),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("As Sunburst", ShowSunburst)
+                .checked(settings.chart == Chart::Sunburst),
+            MenuItem::action("As Treemap", ShowTreemap).checked(settings.chart == Chart::Treemap),
         ]),
         Menu::new("Go").items([
             MenuItem::action("Open Folder", OpenSelected),

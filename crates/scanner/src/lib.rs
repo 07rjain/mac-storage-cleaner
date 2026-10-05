@@ -11,6 +11,7 @@ mod measure;
 mod sys;
 mod tree;
 mod walk;
+mod watch;
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -24,6 +25,7 @@ pub use measure::{Measurement, measure};
 use parking_lot::RwLock;
 pub use parking_lot::RwLockReadGuard;
 pub use tree::{Children, NodeFlags, NodeId, NodeKind, ScanStats, Tree};
+pub use watch::{EventBatch, Refresh, Watch, current_event_id, refresh_targets};
 
 /// The tree of a scan, shareable with other threads. Writers are the scan itself and
 /// [`SharedTree::remove`].
@@ -90,6 +92,9 @@ pub struct ScanHandle {
     cancelled: Arc<AtomicBool>,
     tree: Arc<RwLock<Tree>>,
     thread: JoinHandle<()>,
+    /// FSEvents counter captured before the walk, so a later [`Watch`] can include
+    /// changes that happened while scanning.
+    since_event_id: u64,
 }
 
 impl ScanHandle {
@@ -104,6 +109,10 @@ impl ScanHandle {
 
     pub fn shared_tree(&self) -> SharedTree {
         SharedTree(Arc::clone(&self.tree))
+    }
+
+    pub fn since_event_id(&self) -> u64 {
+        self.since_event_id
     }
 
     /// Stops the scan soon. [`ScanHandle::wait`] then returns a partial tree.
@@ -147,6 +156,7 @@ pub fn start(options: ScanOptions) -> io::Result<ScanHandle> {
         .map_or(4, NonZeroUsize::get);
     let progress = Arc::new(Progress::default());
     let cancelled = Arc::new(AtomicBool::new(false));
+    let since_event_id = current_event_id();
 
     let tree = Arc::new(RwLock::new(Tree::new(options.root.clone())));
     let walk = walk::Walk {
@@ -166,6 +176,7 @@ pub fn start(options: ScanOptions) -> io::Result<ScanHandle> {
         cancelled,
         tree,
         thread,
+        since_event_id,
     })
 }
 

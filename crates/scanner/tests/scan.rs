@@ -299,7 +299,7 @@ fn replace_swaps_in_a_rescanned_folder_and_matches_a_full_scan() {
     assert!(!tree.remove(old_d), "old nodes can't be removed again");
     assert!(
         !tree.replace(tree.root(), &rescan),
-        "the root can't be replaced"
+        "the replacement must be a scan of the same folder"
     );
     assert!(
         !tree.replace(find(&tree, "e.bin"), &rescan),
@@ -309,6 +309,12 @@ fn replace_swaps_in_a_rescanned_folder_and_matches_a_full_scan() {
         !tree.replace(find(&tree, "a/b"), &rescan),
         "paths must match"
     );
+
+    fs::write(root.path().join("extra.bin"), [0u8; 8]).unwrap();
+    let whole = scan(root.path());
+    assert!(tree.replace(tree.root(), &whole));
+    assert_eq!(tree.allocated(tree.root()), whole.allocated(whole.root()));
+    assert!(tree.find(&root.path().join("extra.bin")).is_some());
 }
 
 /// `cargo test -p scanner --release --test scan -- --ignored --nocapture measure_time`

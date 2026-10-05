@@ -95,12 +95,14 @@ Licensing rules:
 
 - **Capacity bar (top, always visible):** used, purgeable and free space for the selected volume. After cleanup it shows the before and after numbers.
 - **Sunburst (center):** the center is the current folder; each ring is one level deeper. Clicking a slice zooms in, and clicking the center goes up. At most 6 rings are shown. Slices narrower than about 0.5° are merged into one "Smaller items" slice.
+- **Treemap (v1.1):** the current folder fills the chart as nested rectangles, sized by allocated space and colored by file type. Switch with View › As Treemap (⌥⌘2) or the Sunburst / Treemap control next to the breadcrumb. Rectangles too small to draw are merged into "Smaller items".
 - **Accounting slices at the root:** other APFS volumes, purgeable space, local snapshots, and "Not measured" (protected or unreadable areas). The "Not measured" slice offers the Full Disk Access prompt.
 - **Files stored only in iCloud** count at their local size, which is close to zero. A separate iCloud view is deferred to Future.
-- **Side list:** the children of the current folder, sorted by size, kept in sync with the chart on hover and selection.
+- **Side list:** the children of the current folder, sorted by size, kept in sync with the chart on hover and selection. After a later scan of the same place, folders that grew or shrank by at least 1 MB show a note, and the status bar shows the total change since last scan.
 - **Breadcrumb:** the path, with a dropdown on each segment for jumping to sibling folders.
 - **Live scan:** folders are muted while being counted and show "≥ 12.4 GB". They switch to full color when final.
-- **Context menu (right-click on a slice or row):** Add to basket (disabled with the reason for refused paths), Open for folders, Quick Look, Reveal in Finder.
+- **Live refresh (v1.1):** after a scan finishes, FSEvents watches the scanned folder. Changed folders are scanned again and swapped into the tree without resetting the window.
+- **Context menu (right-click on a slice or row):** Add to basket (disabled with the reason for refused paths), Open for folders, Quick Look, Reveal in Finder, Rescan This Folder.
 
 ### 6.3 Suggestions
 Cards labelled "Safe to delete" or "Review first", each with a size and item count. Clicking a "Safe to delete" card adds its items to the basket. Every card opens a list with the reason, what was skipped and why, and a per-item Add button. See section 8 for categories.
@@ -155,7 +157,7 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 
 ### 7.7 Refresh
 - v1: a Rescan button, plus rescanning a single folder from the context menu. Done in 0.1.1: the rescanned folder replaces its old subtree in place (`Tree::replace`). Hard links and clones are matched only within the rescan, so a file linked from both inside and outside the folder may count twice until the next full scan.
-- v1.1: incremental refresh with FSEvents. The scanner records the current FSEvents event ID before the walk so this can be added without changing the data model.
+- v1.1: incremental refresh with FSEvents. Done in 0.2.0: the scanner records `FSEventsGetCurrentEventId()` before the walk, then watches from that ID. Changed folders are debounced (~1.2 s), coalesced (a parent absorbs its children; more than eight folders become a root replace), and swapped in with `Tree::replace`, including the scan root. Events replayed from during the scan that would force a full rescan are skipped, because the walk already saw the disk as it finished. The watched path and event paths are matched even when one is a symlink (`/var` vs `/private/var`).
 
 ## 8. Functional requirements: cleanup
 
@@ -202,7 +204,7 @@ Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` 
 - Not captured: expected conditions such as `EPERM` on protected folders, `EDEADLK` on dataless files, or the user cancelling.
 - Releases are tagged `<app-id>@<version>`, matching the changelog version. Environments: `development` and `production`.
 - Debug symbols (dSYM) are uploaded in the release pipeline with `sentry-cli` so stack traces are readable.
-- Native crashes outside Rust panics (for example in Objective-C or C calls) are not captured by the Rust SDK alone. Adding native crash capture is a v1.1 item.
+- Native crashes (SIGSEGV, SIGBUS, SIGILL, SIGFPE, and SIGABRT that is not a Rust panic) are written to a pre-opened file by a signal handler, then sent on the next launch as a Sentry event with mechanism type `signal`. The dump is instruction addresses, image load addresses, sizes, UUIDs, and library file names only — no paths, user names, or memory. Rust panics stay on the panic integration; SIGABRT after a panic is not sent twice.
 
 ### 9.3 Privacy
 A disk tool sees file names that can identify people and projects, so:
@@ -239,6 +241,9 @@ M2 measurements (2026-10-05, same Mac):
 0.1.1 measurements (2026-10-05, same Mac):
 - Frames while scanning the home folder (3.5 million entries, `frame_time_while_scanning_the_home_folder`, an opt-in test): median 2.3–2.5 ms, 99th percentile 5.4–6.9 ms, slowest 6.7–7.1 ms, so every frame is under 16 ms. This times GPUI layout, prepaint and paint on the CPU; GPU work is not included.
 - Will free for 10,000 items (100 folders of 100 files, `measure_time_for_ten_thousand_items`): 76–85 ms. It was about 5 s before removing nested items stopped being quadratic.
+
+0.2.0 measurements (2026-10-06, same Mac):
+- Treemap layout on the home folder (`treemap_layout_time_on_the_home_folder`, an opt-in test, 900×640): 1.31 ms for 3,066 rectangles at the top, then 0.66 / 0.27 / 0.09 ms one to three folders down. Under the 16 ms frame budget.
 
 ### 10.2 Accuracy acceptance
 - Whole-disk chart total within 1% of Disk Utility's container used space on a test Mac.
@@ -291,10 +296,10 @@ M3 results (2026-10-05):
 | Crate | Responsibility | Depends on GPUI |
 |---|---|---|
 | `app` | Window, views, sunburst element, onboarding, settings | Yes |
-| `scanner` | `getattrlistbulk` walk, arena tree, dataless policy | No |
+| `scanner` | `getattrlistbulk` walk, arena tree, dataless policy, FSEvents watch | No |
 | `volumes` | Capacity, per-volume used, purgeable, snapshot list | No |
 | `cleanup` | Suggestion rules, basket, re-check, Trash, operation log | No |
-| `telemetry` | Sentry setup, `before_send` scrubbing, opt-in state | No |
+| `telemetry` | Sentry setup, `before_send` scrubbing, native crash dumps, opt-in state | No |
 | `scan-cli` | `msc-scan` harness: benchmarks, accuracy checks, startup-disk accounting | No |
 
 - System calls through `libc`; Foundation calls (`NSURL` resource keys, `NSFileManager`) through `objc2` and `objc2-foundation`.
@@ -302,9 +307,10 @@ M3 results (2026-10-05):
 
 ### 11.3 Data flow
 1. `scanner` workers write into the arena and send progress batches over a channel.
-2. The `app` view polls the channel on a timer, rebuilds the visible sunburst layout from the current focus folder, and repaints.
-3. Clicks are hit-tested with polar math (angle and radius) instead of per-slice geometry.
-4. `cleanup` reads the arena for suggestions and the basket, and re-checks paths on disk before moving.
+2. The `app` view polls on a timer, rebuilds the visible chart (sunburst or treemap) from the current folder, and repaints.
+3. Clicks are hit-tested with polar math (angle and radius) instead of per-slice geometry. The treemap hit-tests nested rectangles, innermost tile wins.
+4. After a scan finishes, FSEvents batches are coalesced and the changed folders are replaced in the tree.
+5. `cleanup` reads the arena for suggestions and the basket, and re-checks paths on disk before moving.
 
 ## 12. Changelog and release process
 - `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with [Semantic Versioning](https://semver.org/).
@@ -323,7 +329,7 @@ M3 results (2026-10-05):
 | M2 Visualization | Capacity bar, sunburst, side list, breadcrumb, live scan | A full disk is explorable with mouse and keyboard. Done 2026-10-05: interaction tests drive the view with simulated clicks, mouse moves and keystrokes |
 | M3 Cleanup | Suggestions, basket, Will free, Trash, operation log | Will-free test passes; refused paths cannot be added. Done 2026-10-05, see 10.2 |
 | M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, ad-hoc signing, DMG, dSYM upload | DMG installs and runs on macOS 14 or later (notarization waits for a Developer ID). Done 2026-10-05: the DMG's app passes `codesign --verify --strict` and runs after being copied out; tested on the development Mac only, not on a clean macOS 14 machine |
-| v1.1 | FSEvents refresh, treemap tab, native crash capture, scan comparison | Separate PRD update |
+| v1.1 | FSEvents refresh, treemap tab, native crash capture, scan comparison | Done 2026-10-06 as 0.2.0. iCloud, Developer ID signing and notarization stay deferred. |
 | Future: iCloud | "In iCloud, not on this Mac" ring at full logical size, iCloud Drive breakdown, evict and download actions | Separate PRD update |
 
 ## 14. Risks
@@ -344,6 +350,7 @@ Decided (2026-10-05):
 - APFS clones: unedited clones are counted once during the main scan; edited clones are counted in full.
 - App name "Mac Storage Cleaner", bundle ID `io.github.07rjain.mac-storage-cleaner`.
 - 0.1.0 ships as an ad-hoc signed DMG without notarization.
+- 0.2.0 (v1.1): treemap in addition to sunburst; native crash dumps are addresses and library IDs only; scan comparison is notes in the list and status, not a separate chart. iCloud, signing and notarization remain deferred.
 
 Open:
 1. Whether the app is free, paid, or open source.

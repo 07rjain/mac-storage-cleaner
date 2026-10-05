@@ -1,7 +1,9 @@
 //! Sentry error reporting with path scrubbing and a runtime opt-out.
 
+mod native;
 mod scrub;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -17,6 +19,8 @@ pub struct Config {
     pub release: String,
     /// The user's crash-report preference at launch.
     pub enabled: bool,
+    /// Where a native crash dump is written. `None` skips native crash capture.
+    pub crash_file: Option<PathBuf>,
 }
 
 /// Keeps the Sentry client alive. Dropping it flushes pending events.
@@ -51,6 +55,16 @@ pub fn init(config: Config) -> Telemetry {
     }));
 
     let guard = sentry::init((dsn, options));
+
+    if let Some(path) = &config.crash_file {
+        if config.enabled {
+            if let Some(event) = native::install(path) {
+                sentry::capture_event(event);
+            }
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     Telemetry {
         _guard: Some(guard),

@@ -4,26 +4,33 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, FocusHandle, FontWeight, Hsla, MouseButton,
+    AnyElement, Bounds, ClickEvent, Context, Div, FocusHandle, FontWeight, Hsla, MouseButton,
     MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Rgba, Role, ScrollStrategy,
     SharedString, Stateful, Subscription, Task, UniformListScrollHandle, Window, actions, anchored,
     canvas, deferred, div, prelude::*, px, relative, uniform_list,
 };
-use scanner::{NodeId, NodeKind, ScanHandle, ScanOptions, Tree};
+use scanner::{EventBatch, NodeId, NodeKind, Refresh, ScanHandle, ScanOptions, Tree};
 use volumes::{DATA_VOLUME_MOUNT_POINT, StartupDisk};
 
 use self::basket_ui::{Cleanup, DragPreview, DraggedItem};
 use crate::access;
+use crate::compare;
+use crate::file_types::FileType;
 use crate::format;
 use crate::model::{self, Accounting, Item, Row};
+use crate::settings::{Chart, Settings};
 use crate::sunburst::{self, Geometry, Hit, Segment};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
+use crate::treemap::{self, Kind as TileKind};
 use crate::widgets::button;
+use crate::{ShowSunburst, ShowTreemap};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(1_200);
 const ROW_HEIGHT: f32 = 28.0;
 const DROPDOWN_LIMIT: usize = 60;
 
@@ -136,7 +143,7 @@ struct Info {
     size: u64,
     settled: bool,
     items: Option<u64>,
-    note: Option<&'static str>,
+    note: Option<SharedString>,
     path: Option<PathBuf>,
 }
 
@@ -149,6 +156,27 @@ struct Snapshot {
     selected: Option<Info>,
     entries: u64,
     complete: bool,
+    tile_labels: Vec<TileLabel>,
+}
+
+/// Text drawn on a treemap rectangle.
+struct TileLabel {
+    /// Into `StorageView::tiles`.
+    index: usize,
+    name: SharedString,
+    size: Option<String>,
+    /// Folders show their name in the strip above their contents.
+    header: bool,
+}
+
+/// What is under the pointer in either chart.
+enum ChartHit {
+    /// The sunburst's center, which goes up a level.
+    Center,
+    Item {
+        item: Item,
+        folder: bool,
+    },
 }
 
 pub struct StorageView {
@@ -164,15 +192,26 @@ pub struct StorageView {
     dropdown: Option<NodeId>,
     scroll_to_selection: bool,
     rows: Rc<Vec<Row>>,
+    chart: Chart,
     segments: Rc<Vec<Segment>>,
     geometry: Rc<Cell<Option<Geometry>>>,
+    tiles: Rc<treemap::Layout>,
+    /// Where the treemap was last drawn; the next layout uses its size.
+    treemap_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     list_scroll: UniformListScrollHandle,
     cleanup: Cleanup,
     folder_rescan: Option<FolderRescan>,
+    watch: Option<scanner::Watch>,
+    pending_changes: Vec<PathBuf>,
+    pending_flags: u32,
+    history_done: bool,
+    comparison: Option<compare::Comparison>,
     /// As last checked; `None` until the window is first activated.
     full_disk_access: Option<bool>,
     _poll: Option<Task<()>>,
     _disk_read: Option<Task<()>>,
+    _watch_task: Option<Task<()>>,
+    _compare_task: Option<Task<()>>,
     _activation: Option<Subscription>,
 }
 
@@ -191,14 +230,24 @@ impl StorageView {
             dropdown: None,
             scroll_to_selection: false,
             rows: Rc::default(),
+            chart: Chart::default(),
             segments: Rc::default(),
             geometry: Rc::default(),
+            tiles: Rc::default(),
+            treemap_bounds: Rc::default(),
             list_scroll: UniformListScrollHandle::new(),
             cleanup: Cleanup::new(),
             folder_rescan: None,
+            watch: None,
+            pending_changes: Vec::new(),
+            pending_flags: 0,
+            history_done: false,
+            comparison: None,
             full_disk_access: None,
             _poll: None,
             _disk_read: None,
+            _watch_task: None,
+            _compare_task: None,
             _activation: None,
         };
         view.start_scan(scope, cx);
@@ -246,9 +295,17 @@ impl StorageView {
         self.dropdown = None;
         self.rows = Rc::default();
         self.segments = Rc::default();
+        self.tiles = Rc::default();
         self.disk = None;
         self.cleanup.reset(&scope.root());
         self.folder_rescan = None;
+        self.watch = None;
+        self._watch_task = None;
+        self.pending_changes.clear();
+        self.pending_flags = 0;
+        self.history_done = false;
+        self.comparison = None;
+        self._compare_task = None;
         self.read_disk(cx);
 
         let generation = self.generation;
@@ -299,14 +356,22 @@ impl StorageView {
         if generation != self.generation {
             return false;
         }
-        let Some(scan) = &mut self.scan else {
+        if self.scan.is_none() {
             return false;
-        };
+        }
         cx.notify();
-        if scan.handle.is_finished() {
-            scan.elapsed = Some(scan.started.elapsed());
+        let finished = self
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.handle.is_finished());
+        if finished {
+            if let Some(scan) = &mut self.scan {
+                scan.elapsed = Some(scan.started.elapsed());
+            }
             self.read_disk(cx);
             self.compute_suggestions(cx);
+            self.start_watch(cx);
+            self.save_comparison(cx);
             return false;
         }
         true
@@ -362,6 +427,7 @@ impl StorageView {
                     Ok(rescan) if shared.replace(id, &rescan) => {
                         view.tree_changed(cx);
                         view.show_notice(format!("Rescanned {name}"), cx);
+                        view.apply_pending_watch(cx);
                     }
                     Ok(_) => view.show_notice(format!("{name} couldn't be updated"), cx),
                     Err(error) => {
@@ -373,6 +439,204 @@ impl StorageView {
         });
         self.folder_rescan = Some(FolderRescan { name, _task: task });
         cx.notify();
+    }
+
+    fn start_watch(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        self.watch = None;
+        self._watch_task = None;
+        self.pending_changes.clear();
+        self.pending_flags = 0;
+        self.history_done = false;
+        let Some(scan) = &self.scan else {
+            return;
+        };
+        if !scan.handle.tree().is_complete() {
+            return;
+        }
+        let path = self.scope.root();
+        let since = scan.handle.since_event_id();
+        let (watch, rx) = match scanner::Watch::start(&path, since) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!("watching for file changes failed: {error}");
+                return;
+            }
+        };
+        self.watch = Some(watch);
+        let rx = Arc::new(Mutex::new(rx));
+        let generation = self.generation;
+        self._watch_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let rx_recv = Arc::clone(&rx);
+                let first = cx
+                    .background_executor()
+                    .spawn(async move { rx_recv.lock().ok()?.recv().ok() })
+                    .await;
+                let Some(mut batch) = first else {
+                    break;
+                };
+                let deadline = Instant::now() + WATCH_DEBOUNCE;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let rx_wait = Arc::clone(&rx);
+                    let extra = cx
+                        .background_executor()
+                        .spawn(async move { rx_wait.lock().ok()?.recv_timeout(remaining).ok() })
+                        .await;
+                    let Some(more) = extra else {
+                        break;
+                    };
+                    batch.paths.extend(more.paths);
+                    batch.flags |= more.flags;
+                }
+                let running =
+                    this.update(cx, |view, cx| view.apply_watch_batch(generation, batch, cx));
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn apply_watch_batch(
+        &mut self,
+        generation: u64,
+        batch: EventBatch,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        if batch.history_done() {
+            self.history_done = true;
+        }
+        if batch.paths.is_empty() && !batch.needs_full_scan() {
+            return true;
+        }
+        if !self.can_rescan_folder() {
+            self.pending_changes.extend(batch.paths);
+            self.pending_flags |= batch.flags;
+            return true;
+        }
+        self.refresh_from_events(batch.paths, batch.flags, cx);
+        true
+    }
+
+    fn apply_pending_watch(&mut self, cx: &mut Context<Self>) {
+        if self.pending_changes.is_empty() && self.pending_flags == 0 {
+            return;
+        }
+        if !self.can_rescan_folder() {
+            return;
+        }
+        let paths = std::mem::take(&mut self.pending_changes);
+        let flags = std::mem::replace(&mut self.pending_flags, 0);
+        self.refresh_from_events(paths, flags, cx);
+    }
+
+    fn refresh_from_events(&mut self, paths: Vec<PathBuf>, flags: u32, cx: &mut Context<Self>) {
+        let Some(scan) = &self.scan else {
+            return;
+        };
+        if !self.can_rescan_folder() {
+            self.pending_changes.extend(paths);
+            self.pending_flags |= flags;
+            return;
+        }
+        let batch = EventBatch {
+            paths: paths.clone(),
+            flags,
+        };
+        let shared = scan.handle.shared_tree();
+        let tree = scan.handle.tree();
+        let targets = if batch.needs_full_scan() {
+            Refresh::Root
+        } else {
+            scanner::refresh_targets(&tree, &paths)
+        };
+        if !self.history_done && (matches!(targets, Refresh::Root) || batch.needs_full_scan()) {
+            return;
+        }
+        let jobs: Vec<(NodeId, PathBuf)> = match targets {
+            Refresh::None => return,
+            Refresh::Root => vec![(tree.root(), self.scope.root())],
+            Refresh::Folders(ids) => ids.into_iter().map(|id| (id, tree.path(id))).collect(),
+        };
+        drop(tree);
+        let generation = self.generation;
+        let task = cx.spawn(async move |this, cx| {
+            let mut results = Vec::new();
+            for (id, path) in jobs {
+                let rescan = cx
+                    .background_executor()
+                    .spawn(async move { scanner::scan(ScanOptions::new(path)) })
+                    .await;
+                results.push((id, rescan));
+            }
+            let _ = this.update(cx, |view, cx| {
+                if view.generation != generation {
+                    return;
+                }
+                view.folder_rescan.take();
+                let mut any = false;
+                for (id, rescan) in results {
+                    if let Ok(rescan) = rescan {
+                        any |= shared.replace(id, &rescan);
+                    }
+                }
+                if any {
+                    view.tree_changed(cx);
+                }
+                view.apply_pending_watch(cx);
+            });
+        });
+        self.folder_rescan = Some(FolderRescan {
+            name: "changes".into(),
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    fn save_comparison(&mut self, cx: &mut Context<Self>) {
+        let Some(scan) = &self.scan else {
+            return;
+        };
+        if !scan.handle.tree().is_complete() {
+            return;
+        }
+        let shared = scan.handle.shared_tree();
+        let persist = cx
+            .try_global::<Settings>()
+            .is_some_and(Settings::is_persistent);
+        let generation = self.generation;
+        self._compare_task = Some(cx.spawn(async move |this, cx| {
+            let comparison = cx
+                .background_executor()
+                .spawn(async move {
+                    let snapshot = compare::Snapshot::capture(&shared.read());
+                    let previous = persist
+                        .then(|| compare::Snapshot::load_for(&snapshot.root))
+                        .flatten();
+                    let comparison = previous.as_ref().and_then(|p| p.compare(&snapshot));
+                    if persist && let Err(error) = snapshot.save() {
+                        tracing::warn!("failed to save scan snapshot: {error}");
+                    }
+                    comparison
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.generation == generation {
+                    view.comparison = comparison;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn accounting(&self, tree: &Tree) -> Option<Accounting> {
@@ -416,7 +680,15 @@ impl StorageView {
             self.segments
                 .iter()
                 .find(|segment| segment.item == item)
-                .map_or(0, |segment| segment.size)
+                .map(|segment| segment.size)
+                .or_else(|| {
+                    self.tiles
+                        .tiles
+                        .iter()
+                        .find(|tile| tile.item == item)
+                        .map(|tile| tile.size)
+                })
+                .unwrap_or(0)
         };
         let row_size = || {
             self.rows
@@ -431,7 +703,7 @@ impl StorageView {
                 size: tree.allocated(id),
                 settled: tree.is_settled(id),
                 items: (tree.kind(id) == NodeKind::Directory).then(|| u64::from(tree.items(id))),
-                note: model::note(tree, item, complete),
+                note: self.item_note(tree, item, complete),
                 path: Some(tree.path(id)),
             },
             Item::OtherVolumes => Info {
@@ -440,7 +712,7 @@ impl StorageView {
                 size: row_size(),
                 settled: complete,
                 items: None,
-                note: Some("The macOS, VM, Preboot and Recovery volumes on this disk"),
+                note: Some("The macOS, VM, Preboot and Recovery volumes on this disk".into()),
                 path: None,
             },
             Item::NotMeasured => Info {
@@ -455,7 +727,8 @@ impl StorageView {
                 settled: complete,
                 items: None,
                 note: Some(
-                    "Protected folders, snapshots and file-system data the scan couldn't see",
+                    "Protected folders, snapshots and file-system data the scan couldn't see"
+                        .into(),
                 ),
                 path: None,
             },
@@ -465,9 +738,28 @@ impl StorageView {
                 size: segment_size(),
                 settled: tree.is_settled(parent),
                 items: None,
-                note: Some("Items too small to draw one by one"),
+                note: Some("Items too small to draw one by one".into()),
                 path: None,
             },
+        }
+    }
+
+    fn item_note(&self, tree: &Tree, item: Item, complete: bool) -> Option<SharedString> {
+        let flag = model::note(tree, item, complete);
+        let growth = match item {
+            Item::Node(id) if tree.kind(id) == NodeKind::Directory => compare::relative(tree, id)
+                .and_then(|rel| {
+                    self.comparison
+                        .as_ref()
+                        .and_then(|comparison| comparison.folder_note(&rel))
+                }),
+            _ => None,
+        };
+        match (flag, growth) {
+            (Some(flag), Some(growth)) => Some(format!("{flag} · {growth}").into()),
+            (Some(flag), None) => Some(flag.into()),
+            (None, Some(growth)) => Some(growth.into()),
+            (None, None) => None,
         }
     }
 
@@ -479,7 +771,27 @@ impl StorageView {
         let accounting = self.accounting(&tree);
 
         let rows = model::rows(&tree, self.folder, accounting, complete);
-        let segments = sunburst::layout(&tree, self.folder, &rows);
+        match self.chart {
+            Chart::Sunburst => {
+                self.segments = Rc::new(sunburst::layout(&tree, self.folder, &rows));
+                self.tiles = Rc::default();
+            }
+            Chart::Treemap => {
+                let size = self
+                    .treemap_bounds
+                    .get()
+                    .map_or(gpui::size(px(700.), px(480.)), |bounds| bounds.size);
+                self.tiles = Rc::new(treemap::layout(
+                    &tree,
+                    self.folder,
+                    &rows,
+                    f32::from(size.width),
+                    f32::from(size.height),
+                ));
+                self.segments = Rc::default();
+            }
+        }
+        let tile_labels = self.tile_labels(&tree, complete);
         let folder_size: u64 = if accounting.is_some() {
             rows.iter().map(|row| row.size).sum()
         } else {
@@ -493,7 +805,6 @@ impl StorageView {
             }
         }
         self.rows = Rc::new(rows);
-        self.segments = Rc::new(segments);
 
         let crumbs = model::breadcrumb(&tree, self.folder)
             .into_iter()
@@ -523,7 +834,37 @@ impl StorageView {
             folder,
             entries: tree.stats().entries(),
             complete,
+            tile_labels,
         })
+    }
+
+    /// Names for treemap rectangles large enough to hold one, biggest levels first.
+    fn tile_labels(&self, tree: &Tree, complete: bool) -> Vec<TileLabel> {
+        const MAX_LABELS: usize = 300;
+        self.tiles
+            .tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tile)| {
+                let header = tile.header;
+                let fits = header || (tile.rect.w >= 50.0 && tile.rect.h >= 20.0);
+                fits.then(|| {
+                    let name = match tile.item {
+                        Item::Node(id) => self.name(tree, id),
+                        item => self.info(tree, item, complete).name,
+                    };
+                    let size = (header || tile.rect.h >= 36.0)
+                        .then(|| format::size(tile.size, tile.settled));
+                    TileLabel {
+                        index,
+                        name,
+                        size,
+                        header,
+                    }
+                })
+            })
+            .take(MAX_LABELS)
+            .collect()
     }
 
     fn with_tree<R>(&self, read: impl FnOnce(&Tree) -> R) -> Option<R> {
@@ -685,29 +1026,47 @@ impl StorageView {
         .detach();
     }
 
-    fn hit(&self, position: Point<Pixels>) -> Option<Hit> {
-        sunburst::hit_test(&self.segments, self.geometry.get()?, position)
+    fn chart_hit(&self, position: Point<Pixels>) -> Option<ChartHit> {
+        match self.chart {
+            Chart::Sunburst => {
+                match sunburst::hit_test(&self.segments, self.geometry.get()?, position)? {
+                    Hit::Center => Some(ChartHit::Center),
+                    Hit::Segment(index) => {
+                        let segment = self.segments[index];
+                        Some(ChartHit::Item {
+                            item: segment.item,
+                            folder: segment.folder,
+                        })
+                    }
+                }
+            }
+            Chart::Treemap => {
+                let index = treemap::hit_test(&self.tiles, self.treemap_bounds.get()?, position)?;
+                let tile = self.tiles.tiles[index];
+                Some(ChartHit::Item {
+                    item: tile.item,
+                    folder: tile.kind == TileKind::Folder,
+                })
+            }
+        }
     }
 
     fn hover_chart(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let item = match self.hit(event.position) {
-            Some(Hit::Segment(index)) => Some(self.segments[index].item),
+        let item = match self.chart_hit(event.position) {
+            Some(ChartHit::Item { item, .. }) => Some(item),
             _ => None,
         };
         self.set_hovered(item, cx);
     }
 
     fn click_chart(&mut self, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        match self.hit(event.position()) {
-            Some(Hit::Center) => self.go_up(&GoUp, window, cx),
-            Some(Hit::Segment(index)) => {
-                let segment = self.segments[index];
-                match segment.item {
-                    Item::Node(id) if segment.folder => self.open_folder(id, cx),
-                    Item::Smaller(parent) if parent != self.folder => self.open_folder(parent, cx),
-                    item => self.select(Some(item), cx),
-                }
-            }
+        match self.chart_hit(event.position()) {
+            Some(ChartHit::Center) => self.go_up(&GoUp, window, cx),
+            Some(ChartHit::Item { item, folder }) => match item {
+                Item::Node(id) if folder => self.open_folder(id, cx),
+                Item::Smaller(parent) if parent != self.folder => self.open_folder(parent, cx),
+                item => self.select(Some(item), cx),
+            },
             None => self.select(None, cx),
         }
     }
@@ -999,7 +1358,47 @@ impl StorageView {
                         }),
                 );
         }
-        bar
+        bar.child(div().flex_1())
+            .child(self.render_chart_switch(theme))
+    }
+
+    fn render_chart_switch(&self, theme: &Theme) -> impl IntoElement {
+        let selected = theme.selected;
+        let choice = |id: &'static str, label: &'static str, chart: Chart| {
+            let active = self.chart == chart;
+            div()
+                .id(id)
+                .role(Role::RadioButton)
+                .aria_label(label)
+                .aria_selected(active)
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(active, move |this| this.bg(selected))
+                .when(!active, |this| this.text_color(theme.muted))
+                .child(label)
+        };
+        div()
+            .id("chart-switch")
+            .role(Role::RadioGroup)
+            .aria_label("Chart")
+            .flex_none()
+            .flex()
+            .gap_0p5()
+            .p_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                choice("show-sunburst", "Sunburst", Chart::Sunburst)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowSunburst), cx)),
+            )
+            .child(
+                choice("show-treemap", "Treemap", Chart::Treemap)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowTreemap), cx)),
+            )
     }
 
     fn render_dropdown(
@@ -1072,6 +1471,42 @@ impl StorageView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let chart = match self.chart {
+            Chart::Sunburst => self.render_sunburst(snapshot, theme),
+            Chart::Treemap => self.render_treemap(snapshot, theme),
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                chart
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .cursor_pointer()
+                    .on_mouse_move(cx.listener(Self::hover_chart))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            this.set_hovered(None, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(Self::click_chart))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.right_click_chart(event, cx)
+                        }),
+                    ),
+            )
+            .when(self.chart == Chart::Treemap, |this| {
+                this.child(self.render_legend(theme))
+            })
+    }
+
+    fn render_sunburst(&self, snapshot: &Snapshot, theme: &Theme) -> Stateful<Div> {
         let segments = Rc::clone(&self.segments);
         let colors = segments
             .iter()
@@ -1102,10 +1537,6 @@ impl StorageView {
                 format::size(snapshot.folder.size, snapshot.folder.settled)
             ))
             .relative()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .cursor_pointer()
             .child(
                 canvas(
                     move |bounds, _, _| {
@@ -1152,19 +1583,133 @@ impl StorageView {
                             }),
                     ),
             )
-            .on_mouse_move(cx.listener(Self::hover_chart))
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if !*hovered {
-                    this.set_hovered(None, cx);
-                }
+    }
+
+    fn render_treemap(&self, snapshot: &Snapshot, theme: &Theme) -> Stateful<Div> {
+        let layout = Rc::clone(&self.tiles);
+        let colors: Vec<Hsla> = layout
+            .tiles
+            .iter()
+            .map(|tile| theme.tile(tile, self.hovered == Some(tile.item)))
+            .collect();
+        let outline = self
+            .selected
+            .and_then(|item| layout.tiles.iter().position(|tile| tile.item == item))
+            .map(|index| (index, Hsla::from(theme.text)));
+        let labels: Vec<_> = snapshot
+            .tile_labels
+            .iter()
+            .map(|label| {
+                let tile = &layout.tiles[label.index];
+                let rect = tile.rect;
+                let ink = theme::ink_on(colors[label.index]);
+                let height = if label.header {
+                    treemap::HEADER
+                } else {
+                    rect.h - 4.0
+                };
+                div()
+                    .absolute()
+                    .left(px(rect.x + 4.0))
+                    .top(px(rect.y + 1.0))
+                    .w(px((rect.w - 8.0).max(0.0)))
+                    .h(px(height.max(0.0)))
+                    .overflow_hidden()
+                    .text_xs()
+                    .text_color(ink)
+                    .flex()
+                    .when(label.header, |this| this.flex_row().gap_1p5())
+                    .when(!label.header, |this| this.flex_col())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(label.header, |this| this.font_weight(FontWeight::SEMIBOLD))
+                            .child(label.name.clone()),
+                    )
+                    .children(label.size.clone().map(|size| {
+                        div()
+                            .flex_none()
+                            .when(label.header, |this| this.opacity(0.8))
+                            .child(size)
+                    }))
+            })
+            .collect();
+        let bounds_cell = Rc::clone(&self.treemap_bounds);
+        let style = treemap::Paint { colors, outline };
+        div()
+            .id("chart")
+            .role(Role::Image)
+            .aria_label(format!(
+                "Treemap of {}, {}. The list beside it has the same items.",
+                snapshot.folder.name,
+                format::size(snapshot.folder.size, snapshot.folder.settled)
+            ))
+            .relative()
+            .overflow_hidden()
+            .m_2()
+            .child({
+                let (width, height) = (layout.width, layout.height);
+                canvas(
+                    move |bounds, window, _| {
+                        let resized = (f32::from(bounds.size.width) - width).abs() > 1.0
+                            || (f32::from(bounds.size.height) - height).abs() > 1.0;
+                        bounds_cell.set(Some(bounds));
+                        if resized {
+                            window.refresh();
+                        }
+                        bounds
+                    },
+                    move |_, bounds, window, _| treemap::paint(window, bounds, &layout, &style),
+                )
+                .size_full()
+            })
+            .children(labels)
+    }
+
+    fn render_legend(&self, theme: &Theme) -> impl IntoElement {
+        let mut shown: Vec<FileType> = Vec::new();
+        for tile in &self.tiles.tiles {
+            if let TileKind::File(kind) = tile.kind
+                && !shown.contains(&kind)
+            {
+                shown.push(kind);
+            }
+        }
+        shown.sort_by_key(|kind| FileType::ALL.iter().position(|known| known == kind));
+        div()
+            .id("treemap-legend")
+            .role(Role::Group)
+            .aria_label(format!(
+                "Colors: {}",
+                shown
+                    .iter()
+                    .map(|kind| kind.title())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .flex()
+            .flex_wrap()
+            .gap_x_3()
+            .gap_y_1()
+            .px_3()
+            .pb_2()
+            .text_xs()
+            .text_color(theme.muted)
+            .children(shown.into_iter().map(|kind| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .size(px(10.))
+                            .flex_none()
+                            .rounded_sm()
+                            .bg(theme.file_type(kind)),
+                    )
+                    .child(kind.title())
             }))
-            .on_click(cx.listener(Self::click_chart))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.right_click_chart(event, cx)
-                }),
-            )
     }
 
     fn render_list(
@@ -1244,7 +1789,7 @@ impl StorageView {
                     }
                     _ => false,
                 };
-                let note = model::note(&tree, row.item, complete);
+                let note = self.item_note(&tree, row.item, complete);
                 let mut label = format!("{name}, {}", format::size(row.size, row.settled));
                 if folder {
                     label.push_str(", folder");
@@ -1362,23 +1907,35 @@ impl StorageView {
             if let Some(items) = info.items {
                 text.push_str(&format!(" · {}", format::items(items)));
             }
-            if let Some(note) = info.note {
+            if let Some(note) = &info.note {
                 text.push_str(&format!(" · {note}"));
             }
             text
         });
         let progress = match (&self.scan, &self.folder_rescan) {
+            (_, Some(rescan)) if rescan.name.as_ref() == "changes" => "Updating…".into(),
             (_, Some(rescan)) => format!("Rescanning {}…", rescan.name),
             (Some(scan), None) if scan.elapsed.is_none() => format!(
                 "Scanning… {} · {}",
                 format::items(snapshot.entries),
                 format::duration(scan.started.elapsed())
             ),
-            (Some(scan), None) if snapshot.complete => format!(
-                "{} scanned in {}",
-                format::items(snapshot.entries),
-                format::duration(scan.elapsed.unwrap_or_default())
-            ),
+            (Some(scan), None) if snapshot.complete => {
+                let mut text = format!(
+                    "{} scanned in {}",
+                    format::items(snapshot.entries),
+                    format::duration(scan.elapsed.unwrap_or_default())
+                );
+                if let Some(suffix) = self
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.status_suffix())
+                {
+                    text.push_str(" · ");
+                    text.push_str(&suffix);
+                }
+                text
+            }
             (Some(_), None) => format!(
                 "Scan stopped · showing {} found so far",
                 format::items(snapshot.entries)
@@ -1437,6 +1994,9 @@ impl StorageView {
 impl Render for StorageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        self.chart = cx
+            .try_global::<Settings>()
+            .map_or_else(Chart::default, |settings| settings.chart);
         let snapshot = self.snapshot();
 
         let body = match (&self.error, &snapshot) {
@@ -1656,6 +2216,65 @@ mod tests {
         });
         cx.simulate_click(center, Modifiers::default());
         assert_eq!(folder(&view, cx), 0);
+    }
+
+    /// A point inside `item`'s treemap rectangle: its middle, or for folders a pixel inside the
+    /// border, where no contents are drawn.
+    fn tile_point(
+        view: &Entity<StorageView>,
+        cx: &mut VisualTestContext,
+        item: Item,
+    ) -> Point<Pixels> {
+        view.read_with(cx, |view, _| {
+            let bounds = view.treemap_bounds.get().expect("treemap was drawn");
+            let tile = view
+                .tiles
+                .tiles
+                .iter()
+                .find(|tile| tile.item == item)
+                .expect("item has a rectangle");
+            let rect = treemap::to_screen(&view.tiles, bounds, tile.rect);
+            if tile.kind == TileKind::Folder {
+                rect.origin + gpui::point(px(1.5), px(1.5))
+            } else {
+                rect.center()
+            }
+        })
+    }
+
+    #[gpui::test]
+    fn treemap_opens_folders_and_selects_files(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        cx.update(|cx| crate::init(Settings::default(), cx));
+        let (view, cx) = open(root.path(), cx);
+        let big = child(&view, cx, "big");
+        let notes = child(&view, cx, "notes.txt");
+        let Item::Node(big_id) = big else {
+            unreachable!()
+        };
+
+        cx.simulate_keystrokes("alt-cmd-2");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.chart), Chart::Treemap);
+        let fills_bounds = view.read_with(cx, |view, _| {
+            let bounds = view.treemap_bounds.get().unwrap();
+            (view.tiles.width - f32::from(bounds.size.width)).abs() <= 1.0
+        });
+        assert!(fills_bounds, "the layout is redone at the drawn size");
+
+        let position = tile_point(&view, cx, notes);
+        cx.simulate_mouse_move(position, None, Modifiers::default());
+        assert_eq!(view.read_with(cx, |view, _| view.hovered), Some(notes));
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(view.read_with(cx, |view, _| view.selected), Some(notes));
+
+        let position = tile_point(&view, cx, big);
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(folder(&view, cx), big_id);
+
+        cx.simulate_keystrokes("alt-cmd-1");
+        assert_eq!(view.read_with(cx, |view, _| view.chart), Chart::Sunburst);
     }
 
     #[gpui::test]

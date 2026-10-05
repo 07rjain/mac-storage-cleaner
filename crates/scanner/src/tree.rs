@@ -348,17 +348,14 @@ impl Tree {
 
     /// Replaces what is inside the folder `id` with `rescan`, a finished scan of the same folder,
     /// and corrects every ancestor's totals. The old contents are flagged
-    /// [`NodeFlags::REMOVED`].
+    /// [`NodeFlags::REMOVED`]. The scan root can be replaced, which keeps the same root node.
     ///
     /// Hard links and clones are matched only within `rescan`, so a file sharing data with one
     /// outside the folder may now be counted twice.
     ///
-    /// Returns `false`, changing nothing, unless both trees are complete, `id` is a folder other
-    /// than the root that was not removed, and `rescan` is rooted at its path.
+    /// Returns `false`, changing nothing, unless both trees are complete, `id` is a folder that
+    /// was not removed, and `rescan` is rooted at its path.
     pub fn replace(&mut self, id: NodeId, rescan: &Tree) -> bool {
-        let Some(parent) = self.parent(id) else {
-            return false;
-        };
         if !self.complete
             || !rescan.complete
             || self.kind(id) != NodeKind::Directory
@@ -367,6 +364,7 @@ impl Tree {
         {
             return false;
         }
+        let parent = self.parent(id);
 
         let mut old = vec![id];
         while let Some(node) = old.pop() {
@@ -405,7 +403,7 @@ impl Tree {
         target.logical = new.logical;
         target.items = new.items;
         target.flags = new.flags;
-        let mut current = Some(parent);
+        let mut current = parent;
         while let Some(ancestor) = current {
             let node = &mut self.nodes[ancestor as usize];
             node.allocated = node.allocated.saturating_sub(old_allocated) + new.allocated;

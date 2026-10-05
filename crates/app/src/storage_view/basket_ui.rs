@@ -537,8 +537,7 @@ impl StorageView {
     }
 
     pub(super) fn right_click_chart(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if let Some(super::Hit::Segment(index)) = self.hit(event.position) {
-            let item = self.segments[index].item;
+        if let Some(super::ChartHit::Item { item, .. }) = self.chart_hit(event.position) {
             self.open_menu(item, event.position, cx);
         }
     }
@@ -653,7 +652,14 @@ impl StorageView {
 
     /// Refreshes everything that depends on the tree after items were removed or replaced.
     pub(super) fn tree_changed(&mut self, cx: &mut Context<Self>) {
-        self.leave_removed_folders();
+        let folder_path = self.with_tree(|tree| tree.path(self.folder));
+        if let Some(path) = folder_path {
+            if let Some(id) = self.with_tree(|tree| tree.find(&path)).flatten() {
+                self.folder = id;
+            } else {
+                self.leave_removed_folders();
+            }
+        }
         self.read_disk(cx);
         self.compute_suggestions(cx);
         self.basket_changed(cx);

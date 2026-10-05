@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-06
+
+### Added
+- Treemap chart: nested rectangles sized by space and colored by file type, with a legend. Switch from the sunburst with View › As Treemap (⌥⌘2), View › As Sunburst (⌥⌘1), or the control next to the breadcrumb. The choice is saved.
+- After a scan, the app watches the folder with FSEvents and updates changed folders in place, without a full rescan.
+- Native crash reports (segmentation faults and similar) are written as instruction addresses and library IDs only, then sent to Sentry on the next launch. File paths, user names and memory are not recorded. Rust panics are unchanged.
+- The list and status bar show what grew or shrank by at least 1 MB since the last scan of the same place.
+
+### Changed
+- CI uploads the DMG with `actions/upload-artifact@v5`.
+
 ## [0.1.1] - 2026-10-05
 
 ### Added
