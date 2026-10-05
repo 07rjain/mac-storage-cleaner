@@ -1,33 +1,50 @@
+mod about;
+mod access;
 mod format;
 mod model;
+mod preferences;
 mod settings;
 mod storage_view;
 mod sunburst;
 mod theme;
+mod welcome;
+mod widgets;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds,
-    WindowOptions, actions, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, Global, KeyBinding, Menu, MenuItem, Pixels, Size,
+    TitlebarOptions, WindowBounds, WindowOptions, actions, px, size,
 };
 use gpui_platform::application;
 use tracing_subscriber::prelude::*;
 
+use crate::about::About;
+use crate::preferences::Preferences;
 use crate::settings::Settings;
 use crate::storage_view::{
     AddToBasket, Dismiss, EmptyBasket, GoToTop, GoUp, OpenSelected, QuickLook, Rescan,
     RevealInFinder, ReviewBasket, ScanFolder, ScanHomeFolder, ScanStartupDisk, Scope, SelectNext,
-    SelectPrevious, ShowHistory, StopScan, StorageView, ToggleCrashReports,
+    SelectPrevious, ShowHistory, StopScan, StorageView,
 };
+use crate::welcome::Welcome;
 
 pub const APP_ID: &str = "mac-storage-cleaner";
 const APP_NAME: &str = "Mac Storage Cleaner";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-actions!(app, [Quit]);
+actions!(app, [Quit, ShowAbout, ShowSettings, ToggleCrashReports]);
+
+/// The Settings and About windows, so each opens at most once.
+#[derive(Default)]
+struct Panels {
+    settings: Option<AnyWindowHandle>,
+    about: Option<AnyWindowHandle>,
+}
+
+impl Global for Panels {}
 
 fn main() {
     let settings = Settings::load();
@@ -53,9 +70,8 @@ fn main() {
         });
 
     application().run(move |cx: &mut App| {
-        cx.on_action(quit);
-        cx.bind_keys(key_bindings());
-        cx.set_menus(menus(settings.crash_reports));
+        let onboarded = settings.onboarded;
+        init(settings, cx);
         cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 quit(&Quit, cx);
@@ -63,37 +79,128 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(820.), px(560.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(APP_NAME.into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(|cx| StorageView::new(settings.clone(), scope.clone(), cx));
-                let focus = view.read(cx).focus_handle().clone();
-                window.focus(&focus, cx);
-                view
-            },
-        );
-        if let Err(error) = opened {
-            tracing::error!("failed to open main window: {error:#}");
-            quit(&Quit, cx);
-            return;
+        if onboarded {
+            open_main_window(scope, access::has_full_disk_access, cx);
+        } else {
+            open_welcome_window(scope, cx);
         }
-        cx.activate(true);
     });
+}
+
+/// Settings, app-wide actions, key bindings and menus.
+fn init(settings: Settings, cx: &mut App) {
+    cx.set_menus(menus(settings.crash_reports));
+    cx.set_global(settings);
+    cx.set_global(Panels::default());
+    cx.on_action(quit);
+    cx.on_action(|_: &ToggleCrashReports, cx| {
+        settings::update(cx, |settings| {
+            settings.crash_reports = !settings.crash_reports
+        });
+    });
+    cx.on_action(|_: &ShowSettings, cx| open_settings_window(cx));
+    cx.on_action(|_: &ShowAbout, cx| open_about_window(cx));
+    cx.bind_keys(key_bindings());
+}
+
+fn window_options(title: &str, size: Size<Pixels>, resizable: bool, cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size, cx))),
+        titlebar: Some(TitlebarOptions {
+            title: Some(title.to_string().into()),
+            ..Default::default()
+        }),
+        is_resizable: resizable,
+        is_minimizable: resizable,
+        ..Default::default()
+    }
+}
+
+fn open_failed(name: &str, error: impl std::fmt::Display, cx: &mut App) {
+    tracing::error!("failed to open the {name} window: {error:#}");
+    if cx.windows().is_empty() {
+        quit(&Quit, cx);
+    }
+}
+
+pub fn open_main_window(scope: Scope, check_access: fn() -> bool, cx: &mut App) {
+    let options = WindowOptions {
+        window_min_size: Some(size(px(820.), px(560.))),
+        ..window_options(APP_NAME, size(px(1180.), px(780.)), true, cx)
+    };
+    let opened = cx.open_window(options, |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = StorageView::new(scope, cx);
+            view.watch_full_disk_access(check_access, window, cx);
+            view
+        });
+        let focus = view.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
+        view
+    });
+    match opened {
+        Ok(_) => cx.activate(true),
+        Err(error) => open_failed("main", error, cx),
+    }
+}
+
+fn open_welcome_window(scope: Scope, cx: &mut App) {
+    let options = window_options(APP_NAME, size(px(620.), px(640.)), false, cx);
+    let opened = cx.open_window(options, |window, cx| {
+        let view = cx.new(|cx| Welcome::new(scope, access::has_full_disk_access, window, cx));
+        let focus = view.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
+        view
+    });
+    match opened {
+        Ok(_) => cx.activate(true),
+        Err(error) => open_failed("welcome", error, cx),
+    }
+}
+
+/// Brings an open panel to the front. Returns false if it was closed.
+fn activate(handle: Option<AnyWindowHandle>, cx: &mut App) -> bool {
+    handle.is_some_and(|handle| {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    })
+}
+
+fn open_settings_window(cx: &mut App) {
+    if activate(cx.global::<Panels>().settings, cx) {
+        return;
+    }
+    let options = window_options("Settings", size(px(520.), px(420.)), false, cx);
+    match cx.open_window(options, |window, cx| {
+        cx.new(|cx| Preferences::new(window, cx))
+    }) {
+        Ok(handle) => cx.global_mut::<Panels>().settings = Some(handle.into()),
+        Err(error) => open_failed("settings", error, cx),
+    }
+}
+
+fn open_about_window(cx: &mut App) {
+    if activate(cx.global::<Panels>().about, cx) {
+        return;
+    }
+    let options = window_options(
+        &format!("About {APP_NAME}"),
+        size(px(420.), px(240.)),
+        false,
+        cx,
+    );
+    match cx.open_window(options, |_, cx| cx.new(|_| About)) {
+        Ok(handle) => cx.global_mut::<Panels>().about = Some(handle.into()),
+        Err(error) => open_failed("about", error, cx),
+    }
 }
 
 fn key_bindings() -> Vec<KeyBinding> {
     let view = Some("StorageView");
     vec![
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", ShowSettings, None),
         KeyBinding::new("down", SelectNext, view),
         KeyBinding::new("up", SelectPrevious, view),
         KeyBinding::new("enter", OpenSelected, view),
@@ -120,6 +227,9 @@ fn key_bindings() -> Vec<KeyBinding> {
 pub fn menus(crash_reports: bool) -> Vec<Menu> {
     vec![
         Menu::new(APP_NAME).items([
+            MenuItem::action(format!("About {APP_NAME}"), ShowAbout),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", ShowSettings),
             MenuItem::action("Send Crash Reports", ToggleCrashReports).checked(crash_reports),
             MenuItem::separator(),
             MenuItem::action(format!("Quit {APP_NAME}"), Quit),

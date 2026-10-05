@@ -16,10 +16,11 @@ use gpui::{
 };
 use scanner::{Measurement, NodeFlags, NodeId};
 
-use super::{StorageView, button, display_path};
+use super::{StorageView, display_path};
 use crate::format;
 use crate::model::Item;
 use crate::theme::Theme;
+use crate::widgets::{badge, button, primary_button};
 
 /// Rows shown at most in one sheet; the rest are summarized.
 const SHEET_ROWS: usize = 300;
@@ -106,8 +107,7 @@ impl Cleanup {
             notice: None,
             moving: false,
             result: None,
-            log: crate::settings::data_dir()
-                .map(|dir| OperationLog::new(dir.join("cleanup-log.jsonl"))),
+            log: crate::settings::cleanup_log_path().map(OperationLog::new),
             history: Vec::new(),
             _measure: None,
             _suggest: None,
@@ -214,7 +214,7 @@ impl StorageView {
     }
 
     /// A short message in the status bar, for example why an item can't go in the basket.
-    fn show_notice(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(super) fn show_notice(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.cleanup.set_notice(text);
         self.cleanup._notice = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(NOTICE_TIME).await;
@@ -583,12 +583,13 @@ impl StorageView {
         cx.notify();
     }
 
-    /// Treats `home` as the home folder, so a temporary folder can stand in for it.
+    /// Treats `home` as the home folder, and keeps the operation log away from the real one.
     #[cfg(test)]
     pub(super) fn use_home(&mut self, home: &Path) {
         self.cleanup.places = Some(Places {
             home: home.to_path_buf(),
         });
+        self.cleanup.log = None;
         self.cleanup.reset(&self.scope.root());
     }
 
@@ -738,37 +739,6 @@ fn file_name(path: &Path) -> String {
         || display_path(path),
         |name| name.to_string_lossy().into_owned(),
     )
-}
-
-fn badge(label: &'static str, color: gpui::Rgba) -> impl IntoElement {
-    div()
-        .flex_none()
-        .px_1p5()
-        .rounded_sm()
-        .text_xs()
-        .text_color(color)
-        .border_1()
-        .border_color(color)
-        .child(label)
-}
-
-fn primary_button(
-    id: &'static str,
-    label: impl Into<SharedString>,
-    color: gpui::Rgba,
-    enabled: bool,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .whitespace_nowrap()
-        .text_color(gpui::white())
-        .bg(color)
-        .when(enabled, |this| this.cursor_pointer())
-        .when(!enabled, |this| this.opacity(0.45))
-        .child(label.into())
 }
 
 impl StorageView {

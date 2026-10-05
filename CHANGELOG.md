@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-05
+
+First release. Apple silicon, macOS 14 or later. The app is signed ad hoc and not notarized, so the first launch needs System Settings › Privacy & Security › Open Anyway.
+
 ### Added
 - Product requirements document (`PRD.md`) covering scanning, visualization, cleanup, Sentry error reporting and release process.
 - Cargo workspace with the `app` (GPUI window) and `telemetry` (Sentry) crates.
@@ -60,10 +64,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `scanner::measure`, which reads APFS private sizes for Will free. `Tree::find` and `Tree::remove`, so cleaned items leave the tree without a rescan.
 - Opt-in Will free test on a fresh APFS disk image: the free-space change was within 12 KB of the estimate (0.008%).
 
+- Release (M4):
+  - Welcome window on first launch. It explains what the app reads and that nothing is removed without review, shows whether Full Disk Access is on (checked again each time the window comes back to the front), links to its settings pane, and has the crash-report toggle. The scan starts when the user clicks Start Scanning.
+  - Settings window (⌘,): crash reports, Full Disk Access status, and the cleanup log in Finder.
+  - About window with the version, changelog, license and third-party notices. The documents ship inside the app.
+  - The main window suggests a rescan when Full Disk Access is turned on while the app is open.
+  - App bundle `Mac Storage Cleaner.app` (bundle ID `io.github.07rjain.mac-storage-cleaner`) with an icon, signed ad hoc with the hardened runtime, in a DMG.
+  - `scripts/bundle.sh` builds the app and DMG, with the Sentry DSN from the environment or `.env`. `scripts/upload-dsym.sh` creates the Sentry release and uploads the debug symbols. `scripts/make-icon.swift` draws the icon.
+  - Release builds keep line tables in a separate dSYM, so Sentry stack traces show file and line.
+
 ### Changed
 - iCloud features (iCloud-only ring, evict and download) are deferred to a future release. `PRD.md` updated, including M1 and M2 benchmark and accuracy results.
 - The scanner's tree can be read while the scan runs (`ScanHandle::tree`), with totals kept current and `Tree::is_settled` telling whether a folder's total is final.
 - Finished listings now wait in a bounded queue, so peak memory no longer depends on how far the workers get ahead.
+- "Send Crash Reports" is one app-wide setting, shared by the app menu, the welcome window and Settings.
 
 ### Dependencies
 - GPUI and `gpui_platform` pinned to Zed commit `279fe070bb389b79652e52065b2f001edcc0b11b` (2026-10-04).

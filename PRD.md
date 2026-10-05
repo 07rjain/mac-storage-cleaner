@@ -73,7 +73,7 @@ Licensing rules:
 1. A one-screen explanation of what the app reads and that nothing is deleted without review.
 2. A Full Disk Access request with a button that opens the right Settings pane (`x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles`). The app re-checks access when it returns to the foreground. The user can skip this; protected folders then appear as "Not measured".
 3. A notice that crash reports are sent without file names, with a toggle to turn them off (see section 9).
-4. The scan starts automatically on the startup disk.
+4. "Start Scanning" closes the welcome window and starts the scan on the startup disk. The welcome window does not come back after that. It has no Return shortcut, so a stray key press can't skip the Full Disk Access step.
 
 ### 6.2 Main window
 
@@ -150,7 +150,7 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 - "Not measured" = container used space − (scanned bytes + other volumes + purgeable). Never shown as negative; any mismatch is logged.
 
 ### 7.6 Permissions
-- Full Disk Access is detected by checking whether a TCC-protected path is readable (heuristic used by disktree), and re-checked on app activation.
+- Full Disk Access is detected by checking whether a TCC-protected path can be opened (`~/Library/Application Support/com.apple.TCC/TCC.db`, or `~/Library/Safari` if that file doesn't exist; heuristic used by disktree). It is re-checked whenever the welcome, settings or main window comes to the front.
 - Folders that return `EPERM` or `EACCES` are shown as "Not measured", never as 0 bytes.
 
 ### 7.7 Refresh
@@ -297,7 +297,8 @@ M3 results (2026-10-05):
 - `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with [Semantic Versioning](https://semver.org/).
 - Every change that affects users, dependencies, the GPUI pin, Sentry setup or safety rules adds a line under `## [Unreleased]`.
 - A release moves `Unreleased` into a dated version section. The same version is used for the app bundle and the Sentry release.
-- The app's About window shows the version and links to the changelog.
+- The app's About window shows the version and opens the changelog, license and notices bundled in the app.
+- Release steps: `scripts/bundle.sh` (app bundle, ad hoc signature, DMG and dSYM in `dist/`), then `scripts/upload-dsym.sh` (Sentry release and debug symbols), then a Git tag `v<version>` and a GitHub release with the DMG.
 - `THIRD_PARTY_NOTICES.md` is updated in the same change as any copied or adapted MIT or Apache code.
 
 ## 13. Milestones
@@ -308,7 +309,7 @@ M3 results (2026-10-05):
 | M1 Scanner | `scanner` + `volumes` + harness | Accuracy acceptance tests in 10.2 pass; throughput target met |
 | M2 Visualization | Capacity bar, sunburst, side list, breadcrumb, live scan | A full disk is explorable with mouse and keyboard. Done 2026-10-05: interaction tests drive the view with simulated clicks, mouse moves and keystrokes |
 | M3 Cleanup | Suggestions, basket, Will free, Trash, operation log | Will-free test passes; refused paths cannot be added. Done 2026-10-05, see 10.2 |
-| M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, ad-hoc signing, DMG, dSYM upload | DMG installs and runs on macOS 14 or later (notarization waits for a Developer ID) |
+| M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, ad-hoc signing, DMG, dSYM upload | DMG installs and runs on macOS 14 or later (notarization waits for a Developer ID). Done 2026-10-05: the DMG's app passes `codesign --verify --strict` and runs after being copied out; tested on the development Mac only, not on a clean macOS 14 machine |
 | v1.1 | FSEvents refresh, treemap tab, native crash capture, scan comparison | Separate PRD update |
 | Future: iCloud | "In iCloud, not on this Mac" ring at full logical size, iCloud Drive breakdown, evict and download actions | Separate PRD update |
 

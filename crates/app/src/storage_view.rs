@@ -7,26 +7,25 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, MouseButton,
+    AnyElement, ClickEvent, Context, Div, FocusHandle, FontWeight, Hsla, MouseButton,
     MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Rgba, ScrollStrategy,
-    SharedString, Stateful, Task, UniformListScrollHandle, Window, actions, anchored, canvas,
-    deferred, div, prelude::*, px, relative, uniform_list,
+    SharedString, Stateful, Subscription, Task, UniformListScrollHandle, Window, actions, anchored,
+    canvas, deferred, div, prelude::*, px, relative, uniform_list,
 };
 use scanner::{NodeId, NodeKind, ScanHandle, ScanOptions, Tree};
 use volumes::{DATA_VOLUME_MOUNT_POINT, StartupDisk};
 
 use self::basket_ui::{Cleanup, DragPreview, DraggedItem};
+use crate::access;
 use crate::format;
 use crate::model::{self, Accounting, Item, Row};
-use crate::settings::Settings;
 use crate::sunburst::{self, Geometry, Hit, Segment};
 use crate::theme::Theme;
+use crate::widgets::button;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ROW_HEIGHT: f32 = 28.0;
 const DROPDOWN_LIMIT: usize = 60;
-const FULL_DISK_ACCESS_URL: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 
 actions!(
     storage,
@@ -43,7 +42,6 @@ actions!(
         ScanStartupDisk,
         ScanHomeFolder,
         ScanFolder,
-        ToggleCrashReports,
         AddToBasket,
         QuickLook,
         ReviewBasket,
@@ -149,7 +147,6 @@ struct Snapshot {
 
 pub struct StorageView {
     focus_handle: FocusHandle,
-    settings: Settings,
     scope: Scope,
     generation: u64,
     scan: Option<Scan>,
@@ -165,15 +162,17 @@ pub struct StorageView {
     geometry: Rc<Cell<Option<Geometry>>>,
     list_scroll: UniformListScrollHandle,
     cleanup: Cleanup,
+    /// As last checked; `None` until the window is first activated.
+    full_disk_access: Option<bool>,
     _poll: Option<Task<()>>,
     _disk_read: Option<Task<()>>,
+    _activation: Option<Subscription>,
 }
 
 impl StorageView {
-    pub fn new(settings: Settings, scope: Scope, cx: &mut Context<Self>) -> Self {
+    pub fn new(scope: Scope, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             focus_handle: cx.focus_handle(),
-            settings,
             scope: scope.clone(),
             generation: 0,
             scan: None,
@@ -189,11 +188,37 @@ impl StorageView {
             geometry: Rc::default(),
             list_scroll: UniformListScrollHandle::new(),
             cleanup: Cleanup::new(),
+            full_disk_access: None,
             _poll: None,
             _disk_read: None,
+            _activation: None,
         };
         view.start_scan(scope, cx);
         view
+    }
+
+    /// Tells the user to rescan when Full Disk Access is turned on while the app runs.
+    pub fn watch_full_disk_access(
+        &mut self,
+        check_access: fn() -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._activation = Some(
+            cx.observe_window_activation(window, move |view, window, cx| {
+                if !window.is_window_active() {
+                    return;
+                }
+                let granted = check_access();
+                let was = view.full_disk_access.replace(granted);
+                if was == Some(false) && granted && view.scope == Scope::StartupDisk {
+                    view.show_notice(
+                        "Full Disk Access is on. Rescan (⌘R) to measure protected folders.",
+                        cx,
+                    );
+                }
+            }),
+        );
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -594,21 +619,6 @@ impl StorageView {
         .detach();
     }
 
-    fn toggle_crash_reports(
-        &mut self,
-        _: &ToggleCrashReports,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.settings.crash_reports = !self.settings.crash_reports;
-        telemetry::set_enabled(self.settings.crash_reports);
-        if let Err(error) = self.settings.save() {
-            tracing::warn!("failed to save settings: {error}");
-        }
-        cx.set_menus(crate::menus(self.settings.crash_reports));
-        cx.notify();
-    }
-
     fn hit(&self, position: Point<Pixels>) -> Option<Hit> {
         sunburst::hit_test(&self.segments, self.geometry.get()?, position)
     }
@@ -659,26 +669,6 @@ impl StorageView {
         };
         cx.notify();
     }
-}
-
-fn button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let hover = theme.hover;
-    div()
-        .id(id)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.panel)
-        .cursor_pointer()
-        .whitespace_nowrap()
-        .hover(move |style| style.bg(hover))
-        .child(label.into())
 }
 
 /// Paths as the user knows them: firmlinked Data volume paths without the volume prefix, and
@@ -1239,12 +1229,7 @@ impl StorageView {
             .collect()
     }
 
-    fn render_status(
-        &self,
-        snapshot: &Snapshot,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_status(&self, snapshot: &Snapshot, theme: &Theme) -> impl IntoElement {
         let info = snapshot.hovered.as_ref().or(snapshot.selected.as_ref());
         let description = info.map(|info| {
             let mut text = info
@@ -1309,9 +1294,7 @@ impl StorageView {
                         .text_color(accent)
                         .cursor_pointer()
                         .child("Open Full Disk Access settings")
-                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                            cx.open_url(FULL_DISK_ACCESS_URL)
-                        })),
+                        .on_click(|_, _, cx| access::open_settings(cx)),
                 )
             })
             .child(div().flex_none().child(progress))
@@ -1347,7 +1330,7 @@ impl Render for StorageView {
                         .child(self.render_list(&theme, cx)),
                 )
                 .child(self.render_cleanup_bar(&theme, cx))
-                .child(self.render_status(snapshot, &theme, cx))
+                .child(self.render_status(snapshot, &theme))
                 .into_any_element(),
             (None, None) => div().flex_1().into_any_element(),
         };
@@ -1375,7 +1358,6 @@ impl Render for StorageView {
             .on_action(cx.listener(Self::scan_startup_disk))
             .on_action(cx.listener(Self::scan_home_folder))
             .on_action(cx.listener(Self::scan_folder))
-            .on_action(cx.listener(Self::toggle_crash_reports))
             .size_full()
             .flex()
             .flex_col()
@@ -1416,8 +1398,7 @@ mod tests {
     ) -> (Entity<StorageView>, &'a mut VisualTestContext) {
         cx.update(|cx| cx.bind_keys(crate::key_bindings()));
         let scope = Scope::Folder(root.to_path_buf());
-        let (view, cx) =
-            cx.add_window_view(|_, cx| StorageView::new(Settings::default(), scope, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| StorageView::new(scope, cx));
         cx.update(|window, cx| {
             let focus = view.read(cx).focus_handle().clone();
             window.focus(&focus, cx);

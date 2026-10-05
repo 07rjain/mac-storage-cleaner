@@ -9,6 +9,11 @@ license = "MIT"
 rust-version = "1.99"
 publish = false
 
+# Line tables go into a separate dSYM, uploaded to Sentry so crash reports have readable stack traces.
+[profile.release]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
 [workspace.dependencies]
 # Upstream GPUI is pre-1.0. Bump this pin on purpose, in its own change, with a changelog entry.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "279fe070bb389b79652e52065b2f001edcc0b11b", default-features = false, features = ["font-kit"] }

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Mac Storage Cleaner</string>
+	<key>CFBundleExecutable</key>
+	<string>mac-storage-cleaner</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.07rjain.mac-storage-cleaner</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Mac Storage Cleaner</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Rishabh. MIT License.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Mac Storage Cleaner measures the files on your Desktop to show what uses space.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Mac Storage Cleaner measures the files in Documents to show what uses space.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Mac Storage Cleaner measures the files in Downloads to show what uses space and find old installers.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Mac Storage Cleaner measures the files on external drives you choose to scan.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Mac Storage Cleaner measures the files on network drives you choose to scan.</string>
+</dict>
+</plist>

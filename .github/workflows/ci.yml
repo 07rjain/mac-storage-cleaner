@@ -19,3 +19,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --release
+      - name: Bundle the app and DMG (crash reporting off, no DSN in CI)
+        run: ./scripts/bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg
+          path: dist/*.dmg

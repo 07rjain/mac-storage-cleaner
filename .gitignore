@@ -5,3 +5,4 @@
 /target
 *.dSYM
 .DS_Store
+/dist
