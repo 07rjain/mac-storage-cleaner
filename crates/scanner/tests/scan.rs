@@ -232,6 +232,100 @@ fn live_totals_only_grow_and_settle_to_the_sum_of_children() {
 }
 
 #[test]
+fn remove_detaches_a_folder_and_shrinks_its_ancestors() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("a/b")).unwrap();
+    write_bytes(&root.path().join("a/b/c.bin"), 100_000);
+    write_bytes(&root.path().join("a/d.bin"), 5_000);
+    write_bytes(&root.path().join("e.bin"), 5_000);
+    let mut tree = scan(root.path());
+    let b = find(&tree, "a/b");
+    let removed = tree.allocated(b);
+
+    let a = find(&tree, "a");
+    let before = (
+        tree.allocated(a),
+        tree.allocated(tree.root()),
+        tree.items(tree.root()),
+    );
+    assert!(tree.remove(b));
+
+    assert_eq!(tree.allocated(a), before.0 - removed);
+    assert_eq!(tree.allocated(tree.root()), before.1 - removed);
+    assert_eq!(tree.items(tree.root()), before.2 - 2);
+    assert!(tree.children(a).all(|child| child != b));
+    assert!(tree.flags(b).contains(NodeFlags::REMOVED));
+    assert_eq!(tree.path(b), root.path().join("a/b"));
+    assert!(!tree.remove(b), "already removed");
+    assert!(!tree.remove(tree.root()));
+    assert_eq!(
+        tree.find(&root.path().join("a/d.bin")),
+        Some(find(&tree, "a/d.bin"))
+    );
+    assert_eq!(tree.find(&root.path().join("a/b")), None);
+}
+
+#[test]
+fn measure_counts_plain_files_in_full() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("a/b")).unwrap();
+    write_bytes(&root.path().join("a/b/c.bin"), 300_000);
+    write_bytes(&root.path().join("a/d.bin"), 20_000);
+    let expected =
+        allocated(&root.path().join("a/b/c.bin")) + allocated(&root.path().join("a/d.bin"));
+
+    let nested = [root.path().join("a"), root.path().join("a/b/c.bin")];
+    let measurement = scanner::measure(&nested).unwrap();
+
+    assert_eq!(measurement.freeable, expected);
+    assert_eq!(measurement.allocated, expected);
+    assert_eq!(measurement.files, 2, "the nested root is counted once");
+    assert_eq!(measurement.missing, 0);
+}
+
+#[test]
+fn measure_keeps_data_shared_with_clones_outside_the_items() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original.mov");
+    write_bytes(&original, 2_000_000);
+    clone_file(&original, &root.path().join("copy.mov"));
+
+    let one = scanner::measure(&[root.path().join("copy.mov")]).unwrap();
+
+    assert_eq!(one.freeable, 0, "the original still uses every block");
+    assert_eq!(one.shared(), allocated(&original));
+}
+
+#[test]
+fn measure_counts_hard_links_only_when_every_link_goes() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("inside")).unwrap();
+    let original = root.path().join("inside/original.bin");
+    write_bytes(&original, 1_000_000);
+    fs::hard_link(&original, root.path().join("outside.bin")).unwrap();
+    let size = allocated(&original);
+
+    let partial = scanner::measure(&[root.path().join("inside")]).unwrap();
+    let both =
+        scanner::measure(&[root.path().join("inside"), root.path().join("outside.bin")]).unwrap();
+
+    assert_eq!(partial.freeable, 0);
+    assert_eq!(partial.allocated, size);
+    assert_eq!(both.freeable, size);
+    assert_eq!(both.allocated, size);
+}
+
+#[test]
+fn measure_reports_missing_items() {
+    let root = tempfile::tempdir().unwrap();
+
+    let measurement = scanner::measure(&[root.path().join("gone")]).unwrap();
+
+    assert_eq!(measurement.missing, 1);
+    assert_eq!(measurement.freeable, 0);
+}
+
+#[test]
 fn rejects_a_file_as_the_root() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("file.txt");

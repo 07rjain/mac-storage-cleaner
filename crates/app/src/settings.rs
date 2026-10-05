@@ -40,11 +40,15 @@ impl Settings {
     }
 }
 
-fn settings_path() -> Option<PathBuf> {
-    let home = std::env::home_dir()?;
+/// Where the app keeps its settings and the cleanup log.
+pub fn data_dir() -> Option<PathBuf> {
     Some(
-        home.join("Library/Application Support")
-            .join(APP_ID)
-            .join("settings.json"),
+        std::env::home_dir()?
+            .join("Library/Application Support")
+            .join(APP_ID),
     )
+}
+
+fn settings_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("settings.json"))
 }

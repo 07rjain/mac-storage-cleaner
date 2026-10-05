@@ -19,6 +19,14 @@ pub struct Theme {
     pub accent: Rgba,
     pub track: Rgba,
     pub chart_center: Rgba,
+    /// "Safe to delete" badges.
+    pub safe: Rgba,
+    /// "Review first" badges.
+    pub review: Rgba,
+    /// Buttons that move things to the Trash or delete them.
+    pub destructive: Rgba,
+    /// Behind a sheet.
+    pub backdrop: Hsla,
 }
 
 impl Theme {
@@ -36,6 +44,10 @@ impl Theme {
                 accent: rgb(0x0a84ff),
                 track: rgb(0x3a3a3c),
                 chart_center: rgb(0x2c2c2e),
+                safe: rgb(0x30d158),
+                review: rgb(0xff9f0a),
+                destructive: rgb(0xff453a),
+                backdrop: hsla(0.0, 0.0, 0.0, 0.5),
             },
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self {
                 dark: false,
@@ -49,6 +61,10 @@ impl Theme {
                 accent: rgb(0x007aff),
                 track: rgb(0xe3e3e8),
                 chart_center: rgb(0xffffff),
+                safe: rgb(0x248a3d),
+                review: rgb(0xc93400),
+                destructive: rgb(0xd70015),
+                backdrop: hsla(0.0, 0.0, 0.0, 0.25),
             },
         }
     }

@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 
 use crate::Progress;
-use crate::sys::{self, ObjectType, RawEntry};
+use crate::sys::{self, Attributes, ObjectType, RawEntry};
 use crate::tree::{NodeFlags, NodeId, NodeKind, Totals, Tree};
 
 const BUFFER_SIZE: usize = 256 * 1024;
@@ -222,7 +222,7 @@ fn list_directories(jobs: Receiver<Job>, listings: Sender<Listing>, cancelled: A
         }
         let entries = sys::open_directory(&job.path).and_then(|directory| {
             let mut entries = Vec::new();
-            sys::read_directory(&directory, &mut buffer, &mut entries)?;
+            sys::read_directory(&directory, &mut buffer, &mut entries, Attributes::Scan)?;
             Ok(entries)
         });
         let listing = Listing {
@@ -253,7 +253,7 @@ fn record_listing_error(tree: &mut Tree, node: NodeId, error: &io::Error) {
     }
 }
 
-fn child_path(parent: &CString, name: &[u8]) -> CString {
+pub(crate) fn child_path(parent: &CString, name: &[u8]) -> CString {
     let parent = parent.as_bytes();
     let mut path = Vec::with_capacity(parent.len() + 1 + name.len() + 1);
     path.extend_from_slice(parent);

@@ -33,6 +33,8 @@ impl NodeFlags {
     pub const ENTRY_ERROR: Self = Self(1 << 5);
     /// An unedited APFS clone whose data is counted under another file with the same clone ID.
     pub const SHARED_WITH_CLONE: Self = Self(1 << 6);
+    /// Removed with [`Tree::remove`], for example after moving it to the Trash.
+    pub const REMOVED: Self = Self(1 << 7);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -290,6 +292,58 @@ impl Tree {
         let mut children: Vec<NodeId> = self.children(id).collect();
         children.sort_unstable_by_key(|&child| std::cmp::Reverse(self.allocated(child)));
         children
+    }
+
+    /// The node at `path`, which must be the root path or inside it.
+    pub fn find(&self, path: &Path) -> Option<NodeId> {
+        let rest = path.strip_prefix(&self.root_path).ok()?;
+        let mut current = self.root();
+        for component in rest.components() {
+            let name = component.as_os_str();
+            current = self
+                .children(current)
+                .find(|&child| self.name(child) == name)?;
+        }
+        Some(current)
+    }
+
+    /// Detaches `id` and everything inside it, and takes its sizes off every ancestor. Its
+    /// name and path stay readable, and it is flagged [`NodeFlags::REMOVED`].
+    ///
+    /// Returns `false`, changing nothing, for the root, an item already removed, or one whose
+    /// totals are still being counted.
+    pub fn remove(&mut self, id: NodeId) -> bool {
+        let Some(parent) = self.parent(id) else {
+            return false;
+        };
+        if self.flags(id).contains(NodeFlags::REMOVED) || !self.is_settled(id) {
+            return false;
+        }
+        let next = self.nodes[id as usize].next_sibling;
+        if self.nodes[parent as usize].first_child == id {
+            self.nodes[parent as usize].first_child = next;
+        } else {
+            let mut sibling = self.nodes[parent as usize].first_child;
+            while sibling != NO_NODE {
+                if self.nodes[sibling as usize].next_sibling == id {
+                    self.nodes[sibling as usize].next_sibling = next;
+                    break;
+                }
+                sibling = self.nodes[sibling as usize].next_sibling;
+            }
+        }
+        let node = &self.nodes[id as usize];
+        let (allocated, logical, items) = (node.allocated, node.logical, node.items + 1);
+        let mut current = Some(parent);
+        while let Some(ancestor) = current {
+            let node = &mut self.nodes[ancestor as usize];
+            node.allocated = node.allocated.saturating_sub(allocated);
+            node.logical = node.logical.saturating_sub(logical);
+            node.items = node.items.saturating_sub(items);
+            current = self.parent(ancestor);
+        }
+        self.nodes[id as usize].flags |= NodeFlags::REMOVED;
+        true
     }
 
     pub fn path(&self, id: NodeId) -> PathBuf {

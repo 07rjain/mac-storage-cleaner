@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/scan-cli", "crates/scanner", "crates/telemetry", "crates/volumes"]
+members = ["crates/app", "crates/cleanup", "crates/scan-cli", "crates/scanner", "crates/telemetry", "crates/volumes"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ publish = false
 gpui = { git = "https://github.com/zed-industries/zed", rev = "279fe070bb389b79652e52065b2f001edcc0b11b", default-features = false, features = ["font-kit"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "279fe070bb389b79652e52065b2f001edcc0b11b", features = ["font-kit"] }
 
+cleanup = { path = "crates/cleanup" }
 scanner = { path = "crates/scanner" }
 telemetry = { path = "crates/telemetry" }
 volumes = { path = "crates/volumes" }

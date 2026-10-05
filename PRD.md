@@ -100,10 +100,10 @@ Licensing rules:
 - **Side list:** the children of the current folder, sorted by size, kept in sync with the chart on hover and selection.
 - **Breadcrumb:** the path, with a dropdown on each segment for jumping to sibling folders.
 - **Live scan:** folders are muted while being counted and show "≥ 12.4 GB". They switch to full color when final.
-- **Context menu:** Reveal in Finder, Add to basket, Quick Look. M2 ships Reveal in Finder from the Go menu and ⌥⌘R; the right-click menu comes with the basket in M3.
+- **Context menu (right-click on a slice or row):** Add to basket (disabled with the reason for refused paths), Open for folders, Quick Look, Reveal in Finder.
 
 ### 6.3 Suggestions
-Cards labelled "Safe to delete" or "Review first", each with a one-line reason and a size. Clicking a card adds its items to the basket. See section 8 for categories.
+Cards labelled "Safe to delete" or "Review first", each with a size and item count. Clicking a "Safe to delete" card adds its items to the basket. Every card opens a list with the reason, what was skipped and why, and a per-item Add button. See section 8 for categories.
 
 ### 6.4 Review basket
 1. The user drags slices or list items in, or adds a suggestion.
@@ -134,7 +134,7 @@ Cards labelled "Safe to delete" or "Review first", each with a one-line reason a
 - APFS clones are handled during the main scan, because apps such as WhatsApp clone tens of thousands of files and counting each copy overstates use several times over:
   - Unedited clones (`EF_SHARES_ALL_BLOCKS`) with the same `ATTR_CMNEXT_CLONEID` are counted once.
   - Edited clones (`EF_MAY_SHARE_BLOCKS` only) get a new clone ID and can't be matched to the file they share blocks with, so they are counted in full, like `du` and Finder. Their count and size are reported as the upper bound of the overcount.
-  - `ATTR_CMNEXT_PRIVATESIZE` is not requested during the scan: it slowed the walk by about 45%. It can be used later for **Will free** on basket items.
+  - `ATTR_CMNEXT_PRIVATESIZE` is not requested during the scan: it slowed the walk by about 45%. **Will free** reads it only for basket items (`scanner::measure`).
 
 ### 7.4 Dataless files (iCloud-safe scanning)
 - Before any scanning, the scanner process sets `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)`. If this fails, the scan does not start.
@@ -165,13 +165,15 @@ Cards labelled "Safe to delete" or "Review first", each with a one-line reason a
 |---|---|---|
 | Old installers in Downloads and Desktop (`.dmg`, `.pkg`, `.xip`, `.iso`) | Preselected | Older than 90 days |
 | Xcode DerivedData | Preselected | Xcode not running |
-| Xcode iOS DeviceSupport | Preselected | Keep the newest folder per OS |
+| Xcode DeviceSupport (iOS, watchOS, tvOS, visionOS, macOS) | Preselected | Keep the newest folder per platform |
 | Xcode Archives | Review only | Never preselected |
 | Package manager caches (npm, yarn, pnpm, pip, Cargo registry, Homebrew downloads) | Review only | Owning tool not running |
-| Project build folders (`node_modules`, `target`, `.build`, `dist`) | Review only | Not modified in 7 days, and not tracked by Git |
-| `~/Library/Caches/<app>` | Review only | Owning app not running |
+| Project build folders (`node_modules` and `dist` next to `package.json`, `target` next to `Cargo.toml`, `.build` next to `Package.swift`) | Review only | At least 10 MB, not modified in 7 days, and not tracked by Git |
+| `~/Library/Caches/<app>` | Review only | At least 1 MB, owning app not running, never `com.apple.*` |
 | `~/Library/Logs` | Review only | None |
-| Large files (≥ 1 GB) and old large files | Review only | Never preselected |
+| Large files (≥ 1 GB) | Review only | Never preselected |
+
+Suggestions never overlap: an item claimed by one category is not offered by another.
 
 ### 8.2 Show, but don't clean
 Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` and VM images. Each shows its size and a button that opens the right app or settings pane.
@@ -179,7 +181,8 @@ Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` 
 ### 8.3 Safety rules
 - Suggestions come from an allow-list. Anything the app can't classify is never suggested.
 - Personal files are never preselected.
-- Refused at all times: `/System`, `/Library`, `/private`, `/Applications` (v1), the home folder itself, `~/Library` as a whole, any package internals (`.photoslibrary`, `.app`, `MobileSync/Backup` contents), any dataless entry, and any symlink that resolves outside the scanned area.
+- Refused at all times: `/System`, `/Library`, `/private`, `/Applications` and `~/Applications` (v1), other users' folders, the home folder itself and its standard folders (Desktop, Documents, Downloads and so on), `~/Library` and its direct children, the Trash, iCloud Drive and other cloud storage folders, keychains and preferences, Mail, Messages and Photos data, app containers themselves, any package internals (`.photoslibrary`, `.app`, `MobileSync/Backup` contents), external volume roots and their system folders, any dataless entry, and any symlink that resolves outside the scanned area.
+- Permanent deletion only acts on items inside a Trash folder.
 - A cache is skipped if its owning app is running.
 - At confirmation time, each path is re-checked (still exists, same file ID, same type) before it is moved.
 - Items are moved with `NSFileManager trashItemAtURL:resultingItemURL:error:`. A partial failure moves what it can and lists what failed.
@@ -246,10 +249,17 @@ M1 results (2026-10-05):
 - 2,384,434 dataless items reported in every run, before and after scanning, so the scan didn't download any of them.
 - Not yet measured: the whole-disk gap with Full Disk Access granted (M4 onboarding).
 
+M3 results (2026-10-05):
+- Fresh 512 MB APFS disk image (`free_space_gained_matches_will_free`, an opt-in test). The basket held a folder, a large file, an edited clone of a file that stays, and a hard link to a file that stays. Will free said 160,120,832 bytes; emptying the Trash freed 160,133,120 bytes, 12 KB (0.008%) more. Counting allocated sizes would have estimated about 190 MB. Measuring took under 1 ms.
+- On this Mac's startup disk, a 21-item basket of logs and large files was measured as 6.25 GB to free, with 5.92 MB shared with files outside the basket.
+- Refused paths can't be added to the basket (`refused_paths_cannot_be_added`, plus UI tests for the right-click menu and keyboard).
+
 ### 10.3 Platform
 - macOS 14 (Sonoma) or later. Sonoma moved iCloud Drive to File Provider, and DaisyDisk reports clone detection needs macOS 14.
 - Apple silicon (`aarch64-apple-darwin`) only in v1.
-- Unsandboxed, Developer ID signed, hardened runtime, notarized, distributed as a DMG.
+- Unsandboxed, hardened runtime, distributed as a DMG.
+- 0.1.0 is ad-hoc signed and not notarized, because there is no Apple Developer membership yet. The first launch needs right-click › Open, or System Settings › Privacy & Security › Open Anyway. Developer ID signing and notarization come when a membership is available.
+- Ad-hoc signatures change with every build, so macOS treats each build as a new app and Full Disk Access must be granted again after updating.
 
 ### 10.4 Accessibility
 - Every chart slice is reachable from the side list with the keyboard.
@@ -297,8 +307,8 @@ M1 results (2026-10-05):
 | M0 Foundation | Workspace, pinned GPUI window, Sentry with scrubbing, changelog, notices, CI build | Empty window launches; a test panic reaches Sentry with no paths |
 | M1 Scanner | `scanner` + `volumes` + harness | Accuracy acceptance tests in 10.2 pass; throughput target met |
 | M2 Visualization | Capacity bar, sunburst, side list, breadcrumb, live scan | A full disk is explorable with mouse and keyboard. Done 2026-10-05: interaction tests drive the view with simulated clicks, mouse moves and keystrokes |
-| M3 Cleanup | Suggestions, basket, Will free, Trash, operation log | Will-free test passes; refused paths cannot be added |
-| M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, signing, notarization, dSYM upload | Notarized DMG installs and runs on a clean macOS 14 machine |
+| M3 Cleanup | Suggestions, basket, Will free, Trash, operation log | Will-free test passes; refused paths cannot be added. Done 2026-10-05, see 10.2 |
+| M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, ad-hoc signing, DMG, dSYM upload | DMG installs and runs on macOS 14 or later (notarization waits for a Developer ID) |
 | v1.1 | FSEvents refresh, treemap tab, native crash capture, scan comparison | Separate PRD update |
 | Future: iCloud | "In iCloud, not on this Mac" ring at full logical size, iCloud Drive breakdown, evict and download actions | Separate PRD update |
 
@@ -318,11 +328,12 @@ Decided (2026-10-05):
 - GPUI: upstream Zed, pinned commit.
 - iCloud features: deferred to Future. Scanning stays iCloud-safe and never downloads files.
 - APFS clones: unedited clones are counted once during the main scan; edited clones are counted in full.
+- App name "Mac Storage Cleaner", bundle ID `io.github.07rjain.mac-storage-cleaner`.
+- 0.1.0 ships as an ad-hoc signed DMG without notarization.
 
 Open:
-1. App name and bundle ID.
-2. Whether the app is free, paid, or open source.
-3. Whether `/Applications` should be cleanable in a later version (needs an admin prompt).
+1. Whether the app is free, paid, or open source.
+2. Whether `/Applications` should be cleanable in a later version (needs an admin prompt).
 
 ## 16. Research references
 - Apple TN3150, Getting ready for dataless files: https://developer.apple.com/documentation/technotes/tn3150-getting-ready-for-data-less-files

@@ -11,6 +11,7 @@ pub(crate) const DIR_MNTSTATUS_TRIGGER: u32 = 0x0000_0002;
 pub(crate) const EF_MAY_SHARE_BLOCKS: u64 = 0x0000_0001;
 pub(crate) const EF_SHARES_ALL_BLOCKS: u64 = 0x0000_0040;
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008;
 const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100;
 const ATTR_CMNEXT_EXT_FLAGS: u32 = 0x0000_0200;
 const FSOPT_ATTR_CMN_EXTENDED: u64 = 0x0000_0020;
@@ -34,8 +35,33 @@ const DIRECTORY_ATTRIBUTES: u32 = libc::ATTR_DIR_MOUNTSTATUS;
 const FILE_ATTRIBUTES: u32 =
     libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_TOTALSIZE | libc::ATTR_FILE_ALLOCSIZE;
 /// Requested in the fork group, which `FSOPT_ATTR_CMN_EXTENDED` reinterprets.
-/// `ATTR_CMNEXT_PRIVATESIZE` is left out: it slows the scan by about 45%.
+/// `ATTR_CMNEXT_PRIVATESIZE` is only requested for [`Attributes::WithPrivateSize`]: it slows
+/// a listing by about 45%.
 const EXTENDED_ATTRIBUTES: u32 = ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_EXT_FLAGS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attributes {
+    Scan,
+    WithPrivateSize,
+}
+
+impl Attributes {
+    fn list(self) -> libc::attrlist {
+        let private = match self {
+            Self::Scan => 0,
+            Self::WithPrivateSize => ATTR_CMNEXT_PRIVATESIZE,
+        };
+        libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: COMMON_ATTRIBUTES,
+            volattr: 0,
+            dirattr: DIRECTORY_ATTRIBUTES,
+            fileattr: FILE_ATTRIBUTES,
+            forkattr: EXTENDED_ATTRIBUTES | private,
+        }
+    }
+}
 
 unsafe extern "C" {
     fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
@@ -78,6 +104,8 @@ pub(crate) struct RawEntry {
     pub link_count: u32,
     pub logical_size: u64,
     pub allocated_size: u64,
+    /// Bytes not shared with any clone, if requested and reported.
+    pub private_size: Option<u64>,
     /// Same value for files whose data came from the same clone.
     pub clone_id: u64,
     pub extended_flags: u64,
@@ -104,16 +132,9 @@ pub(crate) fn read_directory(
     directory: &OwnedFd,
     buffer: &mut [u8],
     entries: &mut Vec<RawEntry>,
+    attributes: Attributes,
 ) -> io::Result<()> {
-    let mut attributes = libc::attrlist {
-        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-        reserved: 0,
-        commonattr: COMMON_ATTRIBUTES,
-        volattr: 0,
-        dirattr: DIRECTORY_ATTRIBUTES,
-        fileattr: FILE_ATTRIBUTES,
-        forkattr: EXTENDED_ATTRIBUTES,
-    };
+    let mut attributes = attributes.list();
 
     loop {
         // SAFETY: `attributes` and `buffer` are valid for the call, and the kernel writes at
@@ -152,6 +173,34 @@ pub(crate) fn read_directory(
             offset += length as usize;
         }
     }
+}
+
+/// Reads the same attributes as [`read_directory`] for the item at `path` itself, without
+/// following a final symlink.
+pub(crate) fn read_entry(path: &CStr, attributes: Attributes) -> io::Result<RawEntry> {
+    let mut attributes = attributes.list();
+    // Only valid for `getattrlistbulk`; errors come back from the call itself here.
+    attributes.commonattr &= !ATTR_CMN_ERROR;
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: `path` is NUL-terminated, `attributes` and `buffer` are valid for the call, and
+    // the kernel writes at most `buffer.len()` bytes.
+    let result = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&raw mut attributes).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            (FSOPT_ATTR_CMN_EXTENDED | libc::FSOPT_NOFOLLOW as u64) as u32,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = read_u32(&buffer, 0).unwrap_or(0) as usize;
+    buffer
+        .get(..length)
+        .and_then(parse_entry)
+        .ok_or_else(|| io::Error::other("malformed getattrlist reply"))
 }
 
 /// Parses one record. Attributes appear in a fixed order: length, returned attributes, error,
@@ -232,6 +281,11 @@ fn parse_entry(record: &[u8]) -> Option<RawEntry> {
         0
     };
 
+    let private_size = if extended & ATTR_CMNEXT_PRIVATESIZE != 0 {
+        Some(cursor.u64()?)
+    } else {
+        None
+    };
     let clone_id = if extended & ATTR_CMNEXT_CLONEID != 0 {
         cursor.u64()?
     } else {
@@ -253,6 +307,7 @@ fn parse_entry(record: &[u8]) -> Option<RawEntry> {
         link_count,
         logical_size,
         allocated_size,
+        private_size,
         clone_id,
         extended_flags,
         error,

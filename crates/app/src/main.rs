@@ -17,8 +17,9 @@ use tracing_subscriber::prelude::*;
 
 use crate::settings::Settings;
 use crate::storage_view::{
-    Dismiss, GoToTop, GoUp, OpenSelected, Rescan, RevealInFinder, ScanFolder, ScanHomeFolder,
-    ScanStartupDisk, Scope, SelectNext, SelectPrevious, StopScan, StorageView, ToggleCrashReports,
+    AddToBasket, Dismiss, EmptyBasket, GoToTop, GoUp, OpenSelected, QuickLook, Rescan,
+    RevealInFinder, ReviewBasket, ScanFolder, ScanHomeFolder, ScanStartupDisk, Scope, SelectNext,
+    SelectPrevious, ShowHistory, StopScan, StorageView, ToggleCrashReports,
 };
 
 pub const APP_ID: &str = "mac-storage-cleaner";
@@ -109,6 +110,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-1", ScanStartupDisk, view),
         KeyBinding::new("cmd-2", ScanHomeFolder, view),
         KeyBinding::new("cmd-o", ScanFolder, view),
+        KeyBinding::new("cmd-backspace", AddToBasket, view),
+        KeyBinding::new("cmd-b", ReviewBasket, view),
+        KeyBinding::new("space", QuickLook, view),
+        KeyBinding::new("cmd-y", QuickLook, view),
     ]
 }
 
@@ -133,6 +138,14 @@ pub fn menus(crash_reports: bool) -> Vec<Menu> {
             MenuItem::action("Top Level", GoToTop),
             MenuItem::separator(),
             MenuItem::action("Reveal in Finder", RevealInFinder),
+            MenuItem::action("Quick Look", QuickLook),
+        ]),
+        Menu::new("Clean").items([
+            MenuItem::action("Add to Basket / Remove", AddToBasket),
+            MenuItem::action("Review Basket…", ReviewBasket),
+            MenuItem::action("Empty Basket", EmptyBasket),
+            MenuItem::separator(),
+            MenuItem::action("Cleanup History…", ShowHistory),
         ]),
     ]
 }

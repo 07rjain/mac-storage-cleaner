@@ -7,6 +7,7 @@
 //! full, like `du` does, and reported in [`ScanStats`]. The scan stays on the root's file system, never follows
 //! symlinks, and never downloads cloud files: dataless placeholders are recorded but not opened.
 
+mod measure;
 mod sys;
 mod tree;
 mod walk;
@@ -19,9 +20,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
+pub use measure::{Measurement, measure};
 use parking_lot::RwLock;
 pub use parking_lot::RwLockReadGuard;
 pub use tree::{Children, NodeFlags, NodeId, NodeKind, ScanStats, Tree};
+
+/// The tree of a scan, shareable with other threads. Writers are the scan itself and
+/// [`SharedTree::remove`].
+#[derive(Clone)]
+pub struct SharedTree(Arc<RwLock<Tree>>);
+
+impl SharedTree {
+    /// The scan waits while the guard is held, so keep it short.
+    pub fn read(&self) -> RwLockReadGuard<'_, Tree> {
+        self.0.read()
+    }
+
+    /// See [`Tree::remove`].
+    pub fn remove(&self, id: NodeId) -> bool {
+        self.0.write().remove(id)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -78,6 +97,10 @@ impl ScanHandle {
         self.tree.read()
     }
 
+    pub fn shared_tree(&self) -> SharedTree {
+        SharedTree(Arc::clone(&self.tree))
+    }
+
     /// Stops the scan soon. [`ScanHandle::wait`] then returns a partial tree.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
@@ -91,9 +114,10 @@ impl ScanHandle {
         if let Err(panic) = self.thread.join() {
             std::panic::resume_unwind(panic);
         }
-        Arc::into_inner(self.tree)
-            .expect("the scan thread has exited")
-            .into_inner()
+        match Arc::try_unwrap(self.tree) {
+            Ok(tree) => tree.into_inner(),
+            Err(shared) => shared.read().clone(),
+        }
     }
 }
 

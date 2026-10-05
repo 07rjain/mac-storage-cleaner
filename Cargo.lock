@@ -161,8 +161,10 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "cleanup",
  "gpui",
  "gpui_platform",
+ "libc",
  "scanner",
  "serde",
  "serde_json",
@@ -846,6 +848,21 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "cleanup"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "scanner",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "volumes",
 ]
 
 [[package]]

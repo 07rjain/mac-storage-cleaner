@@ -1,3 +1,5 @@
+mod basket_ui;
+
 use std::cell::Cell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -5,14 +7,15 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, MouseMoveEvent,
-    PathPromptOptions, Pixels, Point, Rgba, ScrollStrategy, SharedString, Stateful, Task,
-    UniformListScrollHandle, Window, actions, anchored, canvas, deferred, div, prelude::*, px,
-    relative, uniform_list,
+    AnyElement, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, MouseButton,
+    MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Rgba, ScrollStrategy,
+    SharedString, Stateful, Task, UniformListScrollHandle, Window, actions, anchored, canvas,
+    deferred, div, prelude::*, px, relative, uniform_list,
 };
 use scanner::{NodeId, NodeKind, ScanHandle, ScanOptions, Tree};
 use volumes::{DATA_VOLUME_MOUNT_POINT, StartupDisk};
 
+use self::basket_ui::{Cleanup, DragPreview, DraggedItem};
 use crate::format;
 use crate::model::{self, Accounting, Item, Row};
 use crate::settings::Settings;
@@ -41,6 +44,11 @@ actions!(
         ScanHomeFolder,
         ScanFolder,
         ToggleCrashReports,
+        AddToBasket,
+        QuickLook,
+        ReviewBasket,
+        ShowHistory,
+        EmptyBasket,
     ]
 );
 
@@ -156,6 +164,7 @@ pub struct StorageView {
     segments: Rc<Vec<Segment>>,
     geometry: Rc<Cell<Option<Geometry>>>,
     list_scroll: UniformListScrollHandle,
+    cleanup: Cleanup,
     _poll: Option<Task<()>>,
     _disk_read: Option<Task<()>>,
 }
@@ -179,6 +188,7 @@ impl StorageView {
             segments: Rc::default(),
             geometry: Rc::default(),
             list_scroll: UniformListScrollHandle::new(),
+            cleanup: Cleanup::new(),
             _poll: None,
             _disk_read: None,
         };
@@ -204,6 +214,7 @@ impl StorageView {
         self.rows = Rc::default();
         self.segments = Rc::default();
         self.disk = None;
+        self.cleanup.reset(&scope.root());
         self.read_disk(cx);
 
         let generation = self.generation;
@@ -261,6 +272,7 @@ impl StorageView {
         if scan.handle.is_finished() {
             scan.elapsed = Some(scan.started.elapsed());
             self.read_disk(cx);
+            self.compute_suggestions(cx);
             return false;
         }
         true
@@ -450,6 +462,9 @@ impl StorageView {
     }
 
     fn go_up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.cleanup.is_open() {
+            return;
+        }
         let folder = self.folder;
         if let Some(Some(parent)) = self.with_tree(|tree| tree.parent(folder)) {
             self.folder = parent;
@@ -464,14 +479,40 @@ impl StorageView {
     }
 
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.dropdown.take().is_none() {
+        if self.cleanup.menu.is_some() {
+            self.cleanup.menu = None;
+        } else if self.cleanup.sheet.is_some() {
+            self.close_sheet(cx);
+        } else if self.dropdown.take().is_none() {
             self.selected = None;
         }
         cx.notify();
     }
 
+    fn add_to_basket_action(&mut self, _: &AddToBasket, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = self.selected {
+            self.toggle_in_basket(item, cx);
+        }
+    }
+
+    fn quick_look_action(&mut self, _: &QuickLook, _: &mut Window, cx: &mut Context<Self>) {
+        self.quick_look(cx);
+    }
+
+    fn review_basket(&mut self, _: &ReviewBasket, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_basket(cx);
+    }
+
+    fn show_history(&mut self, _: &ShowHistory, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_history(cx);
+    }
+
+    fn empty_basket_action(&mut self, _: &EmptyBasket, _: &mut Window, cx: &mut Context<Self>) {
+        self.empty_basket(cx);
+    }
+
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        if self.rows.is_empty() || self.cleanup.is_open() {
             return;
         }
         let current = self
@@ -495,7 +536,7 @@ impl StorageView {
     }
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.selected else {
+        let Some(item) = self.selected.filter(|_| !self.cleanup.is_open()) else {
             return;
         };
         if let Item::Node(id) = item
@@ -760,6 +801,15 @@ impl StorageView {
             Some(count) => details.push(format!("{count} local snapshots")),
             None => {}
         }
+        if let Some(result) = &self.cleanup.result
+            && let (Some(before), Some(gained)) = (result.available_before(), result.gained())
+        {
+            details.push(format!(
+                "Before cleanup {} available, {} freed",
+                format::bytes(before),
+                format::bytes(gained)
+            ));
+        }
         let accent = theme.accent;
 
         container
@@ -1022,6 +1072,12 @@ impl StorageView {
                 }
             }))
             .on_click(cx.listener(Self::click_chart))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.right_click_chart(event, cx)
+                }),
+            )
     }
 
     fn render_list(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1087,6 +1143,12 @@ impl StorageView {
                 let selected = self.selected == Some(row.item);
                 let highlighted = self.hovered == Some(row.item);
                 let item = row.item;
+                let in_basket = match (item, &self.cleanup.basket) {
+                    (Item::Node(id), Some(basket)) if !basket.is_empty() => {
+                        basket.contains(&tree.path(id))
+                    }
+                    _ => false,
+                };
                 Some(
                     div()
                         .id(("row", index))
@@ -1111,7 +1173,16 @@ impl StorageView {
                                 .bg(color.opacity(0.55)),
                         )
                         .child(div().size(px(10.)).flex_none().rounded_sm().bg(color))
-                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                        .when(in_basket, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(theme.accent)
+                                    .child("In basket"),
+                            )
+                        })
                         .when_some(model::note(&tree, row.item, complete), |this, note| {
                             this.child(
                                 div()
@@ -1139,6 +1210,23 @@ impl StorageView {
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.click_row(item, event.click_count(), cx);
                         }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.right_click_row(item, event, cx);
+                            }),
+                        )
+                        .when(matches!(item, Item::Node(_)), |this| {
+                            this.on_drag(
+                                DraggedItem {
+                                    item,
+                                    name: name.clone(),
+                                },
+                                |dragged, _, _, cx| {
+                                    cx.new(|_| DragPreview::new(dragged.name.clone()))
+                                },
+                            )
+                        })
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                             if *hovered {
                                 this.set_hovered(Some(item), cx);
@@ -1191,6 +1279,9 @@ impl StorageView {
         };
         let shows_not_measured = info.is_some_and(|info| info.item == Item::NotMeasured);
         let accent: Rgba = theme.accent;
+        let notice = self.cleanup.notice();
+        let has_notice = notice.is_some();
+        let description = notice.map(String::from).or(description);
 
         div()
             .flex()
@@ -1207,6 +1298,7 @@ impl StorageView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .when(has_notice, |this| this.text_color(theme.review))
                     .child(description.unwrap_or_default()),
             )
             .when(shows_not_measured, |this| {
@@ -1254,14 +1346,23 @@ impl Render for StorageView {
                         .child(self.render_chart(snapshot, &theme, cx))
                         .child(self.render_list(&theme, cx)),
                 )
+                .child(self.render_cleanup_bar(&theme, cx))
                 .child(self.render_status(snapshot, &theme, cx))
                 .into_any_element(),
             (None, None) => div().flex_1().into_any_element(),
         };
+        let sheet = self.render_sheet(&theme, cx);
+        let menu = self.render_menu(&theme, cx);
 
         div()
             .key_context("StorageView")
             .track_focus(&self.focus_handle)
+            .relative()
+            .on_action(cx.listener(Self::add_to_basket_action))
+            .on_action(cx.listener(Self::quick_look_action))
+            .on_action(cx.listener(Self::review_basket))
+            .on_action(cx.listener(Self::show_history))
+            .on_action(cx.listener(Self::empty_basket_action))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::open_selected))
@@ -1284,6 +1385,8 @@ impl Render for StorageView {
             .child(self.render_toolbar(&theme, cx))
             .child(self.render_capacity(&theme))
             .child(body)
+            .children(sheet)
+            .children(menu)
     }
 }
 
@@ -1467,6 +1570,141 @@ mod tests {
 
         view.update(cx, |view, cx| view.click_row(big, 2, cx));
         assert_eq!(folder(&view, cx), big_id);
+    }
+
+    fn basket_paths(view: &Entity<StorageView>, cx: &mut VisualTestContext) -> Vec<PathBuf> {
+        view.read_with(cx, |view, _| {
+            view.cleanup
+                .basket
+                .as_ref()
+                .map(|basket| basket.paths())
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    fn keyboard_adds_the_selection_and_will_free_is_measured(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        let (view, cx) = open(root.path(), cx);
+        view.update(cx, |view, _| view.use_home(root.path()));
+
+        cx.simulate_keystrokes("down cmd-backspace");
+        cx.run_until_parked();
+
+        assert_eq!(basket_paths(&view, cx), [root.path().join("big")]);
+        let expected = scanner::measure(&[root.path().join("big")])
+            .unwrap()
+            .freeable;
+        let measured = view.read_with(cx, |view, _| match &view.cleanup.will_free {
+            basket_ui::WillFree::Measured(measurement) => Some(measurement.freeable),
+            _ => None,
+        });
+        assert_eq!(measured, Some(expected));
+
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        assert!(
+            basket_paths(&view, cx).is_empty(),
+            "the same keys take it out again"
+        );
+    }
+
+    #[gpui::test]
+    fn refused_items_stay_out_of_the_basket_with_a_reason(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        fs::create_dir_all(root.path().join("Library/Preferences")).unwrap();
+        fs::write(
+            root.path().join("Library/Preferences/x.plist"),
+            vec![0u8; 4_000_000],
+        )
+        .unwrap();
+        let (view, cx) = open(root.path(), cx);
+        view.update(cx, |view, _| view.use_home(root.path()));
+        let library = child(&view, cx, "Library");
+
+        view.update(cx, |view, cx| view.add_item(library, cx));
+
+        assert!(basket_paths(&view, cx).is_empty());
+        let notice = view.read_with(cx, |view, _| view.cleanup.notice()).unwrap();
+        assert!(notice.contains("can't go in the basket"), "{notice}");
+    }
+
+    #[gpui::test]
+    fn right_click_opens_a_menu_that_escape_closes(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        let (view, cx) = open(root.path(), cx);
+        view.update(cx, |view, _| view.use_home(root.path()));
+        let notes = child(&view, cx, "notes.txt");
+
+        let position = slice_center(&view, cx, notes);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Right,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert!(view.read_with(cx, |view, _| view.cleanup.menu.is_some()));
+        assert_eq!(view.read_with(cx, |view, _| view.selected), Some(notes));
+
+        cx.simulate_keystrokes("escape");
+        assert!(view.read_with(cx, |view, _| view.cleanup.menu.is_none()));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.selected),
+            Some(notes),
+            "the first escape only closes the menu"
+        );
+    }
+
+    #[gpui::test]
+    fn moved_items_leave_the_chart_and_the_basket(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        let (view, cx) = open(root.path(), cx);
+        view.update(cx, |view, _| view.use_home(root.path()));
+        let big = child(&view, cx, "big");
+        let Item::Node(big_id) = big else {
+            unreachable!()
+        };
+        let (before, big_size) = view.read_with(cx, |view, _| {
+            view.with_tree(|tree| (tree.allocated(tree.root()), tree.allocated(big_id)))
+                .unwrap()
+        });
+        view.update(cx, |view, cx| {
+            view.add_item(big, cx);
+            view.open_folder(big_id, cx);
+        });
+        assert_eq!(basket_paths(&view, cx), [root.path().join("big")]);
+
+        let outcome = cleanup::Outcome {
+            moved: vec![cleanup::Moved {
+                path: root.path().join("big"),
+                trashed: None,
+                node: Some(big_id),
+                category: cleanup::Category::Chosen,
+                size: big_size,
+            }],
+            failed: Vec::new(),
+        };
+        view.update(cx, |view, cx| {
+            view.finish_move(outcome, None, None, None, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(folder(&view, cx), 0, "the open folder went to the Trash");
+        assert!(basket_paths(&view, cx).is_empty());
+        let after = view.read_with(cx, |view, _| {
+            view.with_tree(|tree| tree.allocated(tree.root())).unwrap()
+        });
+        assert_eq!(after, before - big_size);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let rows: Vec<Item> =
+            view.read_with(cx, |view, _| view.rows.iter().map(|row| row.item).collect());
+        assert!(!rows.contains(&big));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.cleanup.sheet),
+            Some(basket_ui::Sheet::Basket)
+        );
     }
 
     #[gpui::test]

@@ -35,6 +35,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - "Send Crash Reports" moved to the app menu, as a checked item.
 - `volumes::volume_name` for the name Finder shows, for example "Macintosh HD".
 
+- Cleanup (M3):
+  - Suggestion cards under the chart, appearing after a scan finishes:
+    - "Safe to delete": old installers in Downloads and Desktop, Xcode DerivedData, and old Xcode DeviceSupport folders (the newest per platform is kept).
+    - "Review first": Xcode archives, package manager caches, project build folders, app caches, logs, and large files.
+    - Clicking a "Safe to delete" card adds its items to the basket. Every card opens a list where items can be added one by one.
+  - Caches and DerivedData are skipped while the app or tool that owns them is running. Build folders are skipped if Git tracks them or they changed in the last 7 days.
+  - Cards for places that are shown but not cleaned: Photos library, iPhone and iPad backups, Mail downloads, Messages attachments, the Docker disk and virtual machines. Each opens the right app, settings pane or Finder window.
+  - Basket: add items by dragging list rows onto the basket bar, from the right-click menu, with ⌘⌫, or from a suggestion.
+    - Paths that are never safe to clean are refused with a reason, for example system folders, apps, the home folder and its standard folders, iCloud Drive, package contents, and iCloud placeholders.
+    - Adding a folder replaces items already inside it.
+  - **Will free**, measured on disk:
+    - Clones count only their private blocks.
+    - Hard links count only when every link is in the basket.
+    - Data shared with files outside the basket is reported separately.
+  - Move to Trash:
+    - Each item is checked again just before it moves: same safety rules, same file, and not in use by a running tool.
+    - What moved leaves the chart and the basket, what failed is listed with a reason, and the real free-space change is shown next to the estimate.
+    - "Delete from Trash" removes only the items this cleanup moved there.
+  - Operation log in `~/Library/Application Support/mac-storage-cleaner/cleanup-log.jsonl`, with paths kept only on this Mac, viewable from Clean › Cleanup History.
+  - Right-click menu on chart slices and list rows: Add to Basket or Remove, Open (for folders), Quick Look, Reveal in Finder.
+  - Quick Look with Space or ⌘Y. ⌘B opens the basket. New Clean menu.
+- `cleanup` crate: suggestion rules, path safety checks, basket, running-app detection, Trash moves and the operation log, with tests on a fake home folder.
+- `scanner::measure`, which reads APFS private sizes for Will free. `Tree::find` and `Tree::remove`, so cleaned items leave the tree without a rescan.
+- Opt-in Will free test on a fresh APFS disk image: the free-space change was within 12 KB of the estimate (0.008%).
+
 ### Changed
 - iCloud features (iCloud-only ring, evict and download) are deferred to a future release. `PRD.md` updated, including M1 and M2 benchmark and accuracy results.
 - The scanner's tree can be read while the scan runs (`ScanHandle::tree`), with totals kept current and `Tree::is_settled` telling whether a folder's total is final.
@@ -45,3 +70,4 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Rust toolchain pinned to 1.99.0.
 - `sentry` 0.49.
 - `parking_lot` 0.12 for the scanner's shared tree.
+- `objc2` and `objc2-foundation` 0.3 for `NSFileManager` Trash moves and app bundle identifiers.
