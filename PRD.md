@@ -110,7 +110,7 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 2. The basket shows every item, its size, and **Will free**, with clones and hard links counted once.
 3. One confirmation moves everything to the Trash.
 4. The app shows the real free-space change. If the change is smaller than expected, it explains why (snapshots still hold the data, or shared clone blocks).
-5. Emptying the Trash is a separate, explicit button that shows the Trash size.
+5. Emptying the Trash is a separate, explicit button that shows the Trash size. In 0.1.1 the button deletes only what this cleanup moved and shows the size it frees; the total size of the Trash is shown next to it.
 
 ## 7. Functional requirements: scanning and accuracy
 
@@ -154,7 +154,7 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 - Folders that return `EPERM` or `EACCES` are shown as "Not measured", never as 0 bytes.
 
 ### 7.7 Refresh
-- v1: a Rescan button, plus rescanning a single folder from the context menu.
+- v1: a Rescan button, plus rescanning a single folder from the context menu. Done in 0.1.1: the rescanned folder replaces its old subtree in place (`Tree::replace`). Hard links and clones are matched only within the rescan, so a file linked from both inside and outside the folder may count twice until the next full scan.
 - v1.1: incremental refresh with FSEvents. The scanner records the current FSEvents event ID before the walk so this can be added without changing the data model.
 
 ## 8. Functional requirements: cleanup
@@ -236,6 +236,10 @@ M2 measurements (2026-10-05, same Mac):
 - The first chart appears within one 100 ms refresh of starting the scan.
 - Building the rows and chart layout for one frame takes 0.4 ms at the top of a 3.5-million-entry home folder, and 0.1 ms or less deeper down (`layout_time_on_the_home_folder`, an opt-in test). Painting was not timed separately.
 
+0.1.1 measurements (2026-10-05, same Mac):
+- Frames while scanning the home folder (3.5 million entries, `frame_time_while_scanning_the_home_folder`, an opt-in test): median 2.3–2.5 ms, 99th percentile 5.4–6.9 ms, slowest 6.7–7.1 ms, so every frame is under 16 ms. This times GPUI layout, prepaint and paint on the CPU; GPU work is not included.
+- Will free for 10,000 items (100 folders of 100 files, `measure_time_for_ten_thousand_items`): 76–85 ms. It was about 5 s before removing nested items stopped being quadratic.
+
 ### 10.2 Accuracy acceptance
 - Whole-disk chart total within 1% of Disk Utility's container used space on a test Mac.
 - Zero iCloud downloads during a scan: an evicted test file stays dataless before and after.
@@ -247,7 +251,10 @@ M1 results (2026-10-05):
 - Fresh 256 MB APFS disk image: scanned total within 32 KB of the volume's used space.
 - Home folder totals match `du` to within 0.02% when clone handling is off. With it on, 207 GB of WhatsApp clones count once.
 - 2,384,434 dataless items reported in every run, before and after scanning, so the scan didn't download any of them.
-- Not yet measured: the whole-disk gap with Full Disk Access granted (M4 onboarding).
+
+0.1.1 results (2026-10-05):
+- Whole Data volume with Full Disk Access: 154.4 GB scanned out of 167.1 GB used, 4.49 million entries. The chart again adds up exactly to the container's 197.7 GB used. The remaining 12.7 GB (6.4% of used space) includes 2.3 GB purgeable, and 211 folders that Full Disk Access doesn't open because only root can read them: other users' temporary folders in `/private/var/folders`, `/private/var/db`, the Spotlight and FSEvents stores, and similar system folders. The only one in the home folder was a root-owned updater cache.
+- The M1 run above found the same 211 folders, so it most likely had Full Disk Access too, inherited from the terminal. Its 12.0 GB gap is the same root-only data, not folders that Full Disk Access would open.
 
 M3 results (2026-10-05):
 - Fresh 512 MB APFS disk image (`free_space_gained_matches_will_free`, an opt-in test). The basket held a folder, a large file, an edited clone of a file that stays, and a hard link to a file that stays. Will free said 160,120,832 bytes; emptying the Trash freed 160,133,120 bytes, 12 KB (0.008%) more. Counting allocated sizes would have estimated about 190 MB. Measuring took under 1 ms.
@@ -265,6 +272,12 @@ M3 results (2026-10-05):
 - Every chart slice is reachable from the side list with the keyboard.
 - Colors meet contrast guidelines; size is never shown by color alone.
 - Light and dark appearance follow the system.
+
+0.1.1 status:
+- Contrast: every text color is at least 4.5:1 (WCAG AA) on each surface it is drawn on, in both appearances (`text_colors_meet_wcag_aa_contrast`). Disabled buttons are dimmed and exempt.
+- Sizes and notes are always written out as text next to the colored slices and swatches.
+- VoiceOver: the pinned GPUI reports elements to macOS through AccessKit when they have an ID and a role. Plain text has neither, so controls and rows carry an `aria_label` with what they show. The selected list row is reported as focused, so VoiceOver follows the arrow keys. The chart is one image element; its slices are read through the list.
+- Not yet checked: a pass with VoiceOver itself. GPUI's test windows never turn accessibility on, so the labels have no automated test.
 
 ## 11. Technical architecture
 

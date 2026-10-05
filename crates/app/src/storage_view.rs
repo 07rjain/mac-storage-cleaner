@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, ClickEvent, Context, Div, FocusHandle, FontWeight, Hsla, MouseButton,
-    MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Rgba, ScrollStrategy,
+    MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Rgba, Role, ScrollStrategy,
     SharedString, Stateful, Subscription, Task, UniformListScrollHandle, Window, actions, anchored,
     canvas, deferred, div, prelude::*, px, relative, uniform_list,
 };
@@ -122,6 +122,12 @@ struct Scan {
     elapsed: Option<Duration>,
 }
 
+/// One folder scanned again, to be swapped into the finished scan's tree.
+struct FolderRescan {
+    name: SharedString,
+    _task: Task<()>,
+}
+
 /// What the chart center, the status bar and the tooltips say about one item.
 #[derive(Debug, Clone)]
 struct Info {
@@ -162,6 +168,7 @@ pub struct StorageView {
     geometry: Rc<Cell<Option<Geometry>>>,
     list_scroll: UniformListScrollHandle,
     cleanup: Cleanup,
+    folder_rescan: Option<FolderRescan>,
     /// As last checked; `None` until the window is first activated.
     full_disk_access: Option<bool>,
     _poll: Option<Task<()>>,
@@ -188,6 +195,7 @@ impl StorageView {
             geometry: Rc::default(),
             list_scroll: UniformListScrollHandle::new(),
             cleanup: Cleanup::new(),
+            folder_rescan: None,
             full_disk_access: None,
             _poll: None,
             _disk_read: None,
@@ -240,6 +248,7 @@ impl StorageView {
         self.segments = Rc::default();
         self.disk = None;
         self.cleanup.reset(&scope.root());
+        self.folder_rescan = None;
         self.read_disk(cx);
 
         let generation = self.generation;
@@ -307,6 +316,63 @@ impl StorageView {
         self.scan
             .as_ref()
             .is_some_and(|scan| scan.elapsed.is_none())
+    }
+
+    /// Whether "Rescan This Folder" can run now: the scan finished and nothing else is changing
+    /// the tree.
+    fn can_rescan_folder(&self) -> bool {
+        !self.is_scanning()
+            && self.folder_rescan.is_none()
+            && !self.cleanup.moving
+            && self.with_tree(Tree::is_complete).unwrap_or(false)
+    }
+
+    /// Scans one folder again and swaps the result into the tree, without a full rescan.
+    fn rescan_folder(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if self.with_tree(|tree| id == tree.root()).unwrap_or(false) {
+            self.start_scan(self.scope.clone(), cx);
+            return;
+        }
+        if !self.can_rescan_folder() {
+            self.show_notice("Wait for the scan to finish before rescanning a folder", cx);
+            return;
+        }
+        let Some(scan) = &self.scan else {
+            return;
+        };
+        let shared = scan.handle.shared_tree();
+        let Some((path, name)) = self.with_tree(|tree| (tree.path(id), self.name(tree, id))) else {
+            return;
+        };
+        let generation = self.generation;
+        let task = cx.spawn(async move |this, cx| {
+            let rescan = cx
+                .background_executor()
+                .spawn(async move { scanner::scan(ScanOptions::new(path)) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.generation != generation {
+                    return;
+                }
+                let name = view
+                    .folder_rescan
+                    .take()
+                    .map_or_else(SharedString::default, |rescan| rescan.name);
+                match rescan {
+                    Ok(rescan) if shared.replace(id, &rescan) => {
+                        view.tree_changed(cx);
+                        view.show_notice(format!("Rescanned {name}"), cx);
+                    }
+                    Ok(_) => view.show_notice(format!("{name} couldn't be updated"), cx),
+                    Err(error) => {
+                        tracing::warn!(kind = ?error.kind(), "rescanning a folder failed");
+                        view.show_notice(format!("{name} can't be scanned: {error}"), cx);
+                    }
+                }
+            });
+        });
+        self.folder_rescan = Some(FolderRescan { name, _task: task });
+        cx.notify();
     }
 
     fn accounting(&self, tree: &Tree) -> Option<Accounting> {
@@ -801,8 +867,25 @@ impl StorageView {
             ));
         }
         let accent = theme.accent;
+        let mut summary = format!(
+            "{}: {} used of {}, {} available",
+            disk.name,
+            format::bytes(used),
+            format::bytes(disk.capacity),
+            format::bytes(disk.available)
+        );
+        for detail in &details {
+            summary.push_str(". ");
+            summary.push_str(detail);
+        }
 
         container
+            .id("capacity")
+            .role(Role::Meter)
+            .aria_label(summary)
+            .aria_numeric_value(used as f64 / f64::from(capacity))
+            .aria_min_numeric_value(0.0)
+            .aria_max_numeric_value(1.0)
             .child(
                 div()
                     .flex()
@@ -878,6 +961,8 @@ impl StorageView {
             bar = bar.child(
                 div()
                     .id(("crumb", index))
+                    .role(Role::Button)
+                    .aria_label(name.clone())
                     .px_1p5()
                     .py_0p5()
                     .rounded_sm()
@@ -895,6 +980,9 @@ impl StorageView {
                 bar.child(
                     div()
                         .id(("crumb-menu", index))
+                        .role(Role::Button)
+                        .aria_label(format!("Folders in {name}"))
+                        .aria_expanded(open)
                         .px_1()
                         .py_0p5()
                         .rounded_sm()
@@ -923,6 +1011,7 @@ impl StorageView {
         let hover = theme.hover;
         let mut list = div()
             .id("crumb-dropdown")
+            .role(Role::Menu)
             .occlude()
             .mt_6()
             .min_w(px(260.))
@@ -954,6 +1043,8 @@ impl StorageView {
             list = list.child(
                 div()
                     .id(("dropdown-item", index))
+                    .role(Role::MenuItem)
+                    .aria_label(format!("{name}, {size}"))
                     .flex()
                     .gap_3()
                     .px_3()
@@ -1004,6 +1095,12 @@ impl StorageView {
 
         div()
             .id("chart")
+            .role(Role::Image)
+            .aria_label(format!(
+                "Chart of {}, {}. The list beside it has the same items.",
+                snapshot.folder.name,
+                format::size(snapshot.folder.size, snapshot.folder.settled)
+            ))
             .relative()
             .flex_1()
             .min_w_0()
@@ -1070,9 +1167,17 @@ impl StorageView {
             )
     }
 
-    fn render_list(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_list(
+        &self,
+        snapshot: &Snapshot,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let count = self.rows.len();
         div()
+            .id("list")
+            .role(Role::List)
+            .aria_label(format!("Items in {}", snapshot.folder.name))
             .w(px(380.))
             .h_full()
             .flex()
@@ -1139,9 +1244,26 @@ impl StorageView {
                     }
                     _ => false,
                 };
+                let note = model::note(&tree, row.item, complete);
+                let mut label = format!("{name}, {}", format::size(row.size, row.settled));
+                if folder {
+                    label.push_str(", folder");
+                }
+                if let Some(note) = &note {
+                    label.push_str(&format!(", {note}"));
+                }
+                if in_basket {
+                    label.push_str(", in basket");
+                }
                 Some(
                     div()
                         .id(("row", index))
+                        .role(Role::ListItem)
+                        .aria_label(label)
+                        .aria_selected(selected)
+                        .aria_position_in_set(index + 1)
+                        .aria_size_of_set(self.rows.len())
+                        .when(selected, |this| this.aria_active_descendant())
                         .relative()
                         .w_full()
                         .h(px(ROW_HEIGHT))
@@ -1173,7 +1295,7 @@ impl StorageView {
                                     .child("In basket"),
                             )
                         })
-                        .when_some(model::note(&tree, row.item, complete), |this, note| {
+                        .when_some(note, |this, note| {
                             this.child(
                                 div()
                                     .flex_none()
@@ -1245,30 +1367,39 @@ impl StorageView {
             }
             text
         });
-        let progress = match &self.scan {
-            Some(scan) if scan.elapsed.is_none() => format!(
+        let progress = match (&self.scan, &self.folder_rescan) {
+            (_, Some(rescan)) => format!("Rescanning {}…", rescan.name),
+            (Some(scan), None) if scan.elapsed.is_none() => format!(
                 "Scanning… {} · {}",
                 format::items(snapshot.entries),
                 format::duration(scan.started.elapsed())
             ),
-            Some(scan) if snapshot.complete => format!(
+            (Some(scan), None) if snapshot.complete => format!(
                 "{} scanned in {}",
                 format::items(snapshot.entries),
                 format::duration(scan.elapsed.unwrap_or_default())
             ),
-            Some(_) => format!(
+            (Some(_), None) => format!(
                 "Scan stopped · showing {} found so far",
                 format::items(snapshot.entries)
             ),
-            None => String::new(),
+            (None, None) => String::new(),
         };
         let shows_not_measured = info.is_some_and(|info| info.item == Item::NotMeasured);
         let accent: Rgba = theme.accent;
         let notice = self.cleanup.notice();
         let has_notice = notice.is_some();
         let description = notice.map(String::from).or(description);
+        let summary = match &description {
+            Some(description) if !progress.is_empty() => format!("{description}. {progress}"),
+            Some(description) => description.clone(),
+            None => progress.clone(),
+        };
 
         div()
+            .id("status")
+            .role(Role::Status)
+            .aria_label(summary)
             .flex()
             .items_center()
             .gap_3()
@@ -1290,6 +1421,8 @@ impl StorageView {
                 this.child(
                     div()
                         .id("full-disk-access")
+                        .role(Role::Link)
+                        .aria_label("Open Full Disk Access settings")
                         .flex_none()
                         .text_color(accent)
                         .cursor_pointer()
@@ -1327,7 +1460,7 @@ impl Render for StorageView {
                         .min_h_0()
                         .flex()
                         .child(self.render_chart(snapshot, &theme, cx))
-                        .child(self.render_list(&theme, cx)),
+                        .child(self.render_list(snapshot, &theme, cx)),
                 )
                 .child(self.render_cleanup_bar(&theme, cx))
                 .child(self.render_status(snapshot, &theme))
@@ -1338,6 +1471,8 @@ impl Render for StorageView {
         let menu = self.render_menu(&theme, cx);
 
         div()
+            .id("storage-view")
+            .role(Role::Group)
             .key_context("StorageView")
             .track_focus(&self.focus_handle)
             .relative()
@@ -1588,6 +1723,79 @@ mod tests {
             basket_paths(&view, cx).is_empty(),
             "the same keys take it out again"
         );
+    }
+
+    /// Layout, prepaint and paint of the whole window, every 100 ms while the home folder is
+    /// scanned. GPU work is not included.
+    /// `cargo test -p app --release -- --ignored --nocapture frame_time`
+    #[gpui::test]
+    #[ignore = "scans the home folder"]
+    fn frame_time_while_scanning_the_home_folder(cx: &mut TestAppContext) {
+        let home = home_folder().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| StorageView::new(Scope::Folder(home), cx));
+        let mut frames = Vec::new();
+        while view.read_with(cx, |view, _| view.is_scanning()) {
+            std::thread::sleep(POLL_INTERVAL);
+            cx.executor().advance_clock(POLL_INTERVAL);
+            let started = Instant::now();
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            if view.read_with(cx, |view, _| view.is_scanning()) {
+                frames.push(started.elapsed());
+            }
+        }
+        frames.sort_unstable();
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let entries = view.read_with(cx, |view, _| {
+            view.with_tree(|tree| tree.stats().entries()).unwrap()
+        });
+        println!(
+            "{} frames over {entries} entries: median {:.2} ms, 99th percentile {:.2} ms, slowest {:.2} ms",
+            frames.len(),
+            ms(frames[frames.len() / 2]),
+            ms(frames[frames.len() * 99 / 100]),
+            ms(*frames.last().unwrap()),
+        );
+        assert!(
+            *frames.last().unwrap() < Duration::from_millis(16),
+            "every frame fits in 16 ms"
+        );
+    }
+
+    #[gpui::test]
+    fn rescanning_a_folder_updates_the_chart_without_a_full_scan(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        let (view, cx) = open(root.path(), cx);
+        view.update(cx, |view, _| view.use_home(root.path()));
+        let Item::Node(small) = child(&view, cx, "small") else {
+            unreachable!()
+        };
+        let generation = view.read_with(cx, |view, _| view.generation);
+        fs::write(root.path().join("small/new.bin"), vec![5u8; 2_000_000]).unwrap();
+
+        view.update(cx, |view, cx| view.rescan_folder(small, cx));
+        assert!(
+            !view.read_with(cx, |view, _| view.can_rescan_folder()),
+            "one rescan at a time"
+        );
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if view.read_with(cx, |view, _| view.folder_rescan.is_none()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let fresh = scanner::scan(ScanOptions::new(root.path())).unwrap();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.generation, generation, "no full scan started");
+            view.with_tree(|tree| {
+                assert_eq!(tree.allocated(tree.root()), fresh.allocated(fresh.root()));
+                assert!(tree.allocated(small) >= 2_000_000);
+            });
+            let notice = view.cleanup.notice().unwrap();
+            assert_eq!(notice.as_ref(), "Rescanned small");
+        });
     }
 
     #[gpui::test]

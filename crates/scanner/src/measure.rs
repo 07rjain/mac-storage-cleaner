@@ -69,11 +69,12 @@ pub fn measure(roots: &[PathBuf]) -> io::Result<Measurement> {
 /// Drops every root that is inside another one.
 fn outermost(roots: &[PathBuf]) -> Vec<&Path> {
     let mut sorted: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    // Paths sort by component, so everything inside a root comes right after it.
     sorted.sort();
     sorted.dedup();
     let mut kept: Vec<&Path> = Vec::with_capacity(sorted.len());
     for root in sorted {
-        if !kept.iter().any(|outer| root.starts_with(outer)) {
+        if kept.last().is_none_or(|outer| !root.starts_with(outer)) {
             kept.push(root);
         }
     }
@@ -205,5 +206,25 @@ impl Tally {
             }
         }
         self.measurement
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outermost_drops_nested_roots_and_keeps_look_alike_siblings() {
+        let roots: Vec<PathBuf> = [
+            "/a/b/c", "/ab", "/a", "/a b", "/a/b", "/x/y", "/x/y", "/x/z",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let kept: Vec<&str> = outermost(&roots)
+            .into_iter()
+            .map(|path| path.to_str().unwrap())
+            .collect();
+        assert_eq!(kept, ["/a", "/a b", "/ab", "/x/y", "/x/z"]);
     }
 }

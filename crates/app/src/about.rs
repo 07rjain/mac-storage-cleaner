@@ -6,7 +6,7 @@ use std::process::Command;
 use gpui::{Context, FontWeight, Render, Window, div, prelude::*};
 
 use crate::theme::Theme;
-use crate::widgets::button;
+use crate::widgets::{button, heading, label};
 use crate::{APP_NAME, VERSION};
 
 pub struct About;
@@ -54,21 +54,16 @@ impl Render for About {
             .text_color(theme.text)
             .text_sm()
             .child(
-                div()
+                heading("name", APP_NAME)
+                    .aria_level(1)
                     .text_lg()
-                    .font_weight(FontWeight::BOLD)
-                    .child(APP_NAME),
+                    .font_weight(FontWeight::BOLD),
             )
+            .child(label("version", format!("Version {VERSION}")).text_color(theme.muted))
             .child(
-                div()
-                    .text_color(theme.muted)
-                    .child(format!("Version {VERSION}")),
-            )
-            .child(
-                div()
+                label("copyright", "© 2026 Rishabh · MIT License")
                     .text_xs()
-                    .text_color(theme.muted)
-                    .child("© 2026 Rishabh · MIT License"),
+                    .text_color(theme.muted),
             )
             .child(
                 div()

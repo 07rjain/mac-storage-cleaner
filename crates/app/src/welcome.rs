@@ -1,14 +1,14 @@
 //! The first-launch window: what the app reads, Full Disk Access and crash reports.
 
 use gpui::{
-    AnyElement, ClickEvent, Context, FocusHandle, FontWeight, Render, SharedString, Subscription,
-    Window, actions, div, prelude::*,
+    AnyElement, ClickEvent, Context, ElementId, FocusHandle, FontWeight, Render, Role,
+    SharedString, Subscription, Window, actions, div, prelude::*,
 };
 
 use crate::settings::{self, Settings};
 use crate::storage_view::Scope;
 use crate::theme::Theme;
-use crate::widgets::{badge, button, checkbox, primary_button};
+use crate::widgets::{badge, button, checkbox, heading, label, primary_button};
 use crate::{APP_NAME, ToggleCrashReports};
 
 actions!(welcome, [StartScanning]);
@@ -70,10 +70,13 @@ impl Welcome {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(heading(title, title))
                     .children(status),
             )
-            .child(div().text_color(theme.muted).child(body.into()))
+            .child(
+                label(ElementId::Name(format!("{title} body").into()), body)
+                    .text_color(theme.muted),
+            )
     }
 }
 
@@ -81,11 +84,19 @@ impl Render for Welcome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let crash_reports = cx.global::<Settings>().crash_reports;
-        let status = if self.full_disk_access {
-            badge("On", theme.safe)
-        } else {
-            badge("Off", theme.review)
-        };
+        let status = div()
+            .id("full-disk-access-status")
+            .role(Role::Label)
+            .aria_label(if self.full_disk_access {
+                "Full Disk Access is on"
+            } else {
+                "Full Disk Access is off"
+            })
+            .child(if self.full_disk_access {
+                badge("On", theme.safe)
+            } else {
+                badge("Off", theme.review)
+            });
 
         let mut access = Self::render_section(
             "Full Disk Access",
@@ -105,9 +116,16 @@ impl Render for Welcome {
                 ),
             ));
             if self.opened_settings {
-                access = access.child(div().text_xs().text_color(theme.muted).child(format!(
-                    "Turn on {APP_NAME} in the list. If macOS asks, choose Quit & Reopen."
-                )));
+                access = access.child(
+                    label(
+                        "full-disk-access-hint",
+                        format!(
+                            "Turn on {APP_NAME} in the list. If macOS asks, choose Quit & Reopen."
+                        ),
+                    )
+                    .text_xs()
+                    .text_color(theme.muted),
+                );
             }
         }
 
@@ -149,15 +167,17 @@ impl Render for Welcome {
                             .flex_col()
                             .gap_1()
                             .child(
-                                div()
+                                heading("welcome-title", format!("Welcome to {APP_NAME}"))
+                                    .aria_level(1)
                                     .text_xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(format!("Welcome to {APP_NAME}")),
+                                    .font_weight(FontWeight::BOLD),
                             )
                             .child(
-                                div()
-                                    .text_color(theme.muted)
-                                    .child("See what fills your disk, and clean it up safely."),
+                                label(
+                                    "welcome-subtitle",
+                                    "See what fills your disk, and clean it up safely.",
+                                )
+                                .text_color(theme.muted),
                             ),
                     )
                     .child(Self::render_section(
@@ -186,9 +206,10 @@ impl Render for Welcome {
                     .border_t_1()
                     .border_color(theme.border)
                     .child(
-                        primary_button("start", "Start Scanning", theme.accent, true).on_click(
-                            |_, window, cx| window.dispatch_action(Box::new(StartScanning), cx),
-                        ),
+                        primary_button("start", "Start Scanning", theme.accent_fill, true)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(StartScanning), cx)
+                            }),
                     ),
             )
     }

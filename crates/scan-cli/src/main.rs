@@ -17,7 +17,9 @@ Scans PATH, or the startup disk's Data volume when PATH is omitted.
   --top N       largest children of the root to list (default: 10)
   --du          also run `du -sk PATH` and compare totals
   --list-dataless N
-                print up to N paths flagged as dataless";
+                print up to N paths flagged as dataless
+  --list-unreadable N
+                print up to N folders that couldn't be read";
 
 struct Args {
     root: Option<PathBuf>,
@@ -25,6 +27,7 @@ struct Args {
     top: usize,
     compare_du: bool,
     list_dataless: usize,
+    list_unreadable: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -34,6 +37,7 @@ fn parse_args() -> Result<Args, String> {
         top: 10,
         compare_du: false,
         list_dataless: 0,
+        list_unreadable: 0,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(arg) = raw.next() {
@@ -50,6 +54,12 @@ fn parse_args() -> Result<Args, String> {
             "--list-dataless" => {
                 let value = raw.next().ok_or("--list-dataless needs a value")?;
                 args.list_dataless = value.parse().map_err(|_| "invalid --list-dataless value")?;
+            }
+            "--list-unreadable" => {
+                let value = raw.next().ok_or("--list-unreadable needs a value")?;
+                args.list_unreadable = value
+                    .parse()
+                    .map_err(|_| "invalid --list-unreadable value")?;
             }
             "-h" | "--help" => return Err(String::new()),
             path if !path.starts_with('-') && args.root.is_none() => {
@@ -107,7 +117,20 @@ fn main() -> ExitCode {
         compare_with_du(&tree);
     }
     if args.list_dataless > 0 {
-        list_dataless(&tree, args.list_dataless);
+        list_flagged(
+            &tree,
+            NodeFlags::DATALESS,
+            "Dataless items",
+            args.list_dataless,
+        );
+    }
+    if args.list_unreadable > 0 {
+        list_flagged(
+            &tree,
+            NodeFlags::UNREADABLE,
+            "Unreadable folders",
+            args.list_unreadable,
+        );
     }
     ExitCode::SUCCESS
 }
@@ -274,10 +297,10 @@ fn compare_with_du(tree: &Tree) {
     );
 }
 
-fn list_dataless(tree: &Tree, limit: usize) {
-    println!("\nDataless items:");
+fn list_flagged(tree: &Tree, flag: NodeFlags, heading: &str, limit: usize) {
+    println!("\n{heading}:");
     let flagged = (0..tree.len() as NodeId)
-        .filter(|&node| tree.flags(node).contains(NodeFlags::DATALESS))
+        .filter(|&node| tree.flags(node).contains(flag))
         .take(limit);
     for node in flagged {
         println!("  {}", tree.path(node).display());

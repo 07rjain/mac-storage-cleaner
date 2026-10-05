@@ -159,7 +159,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cleanup",
  "gpui",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "cleanup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "objc2 0.6.4",
@@ -5001,7 +5001,7 @@ dependencies = [
 
 [[package]]
 name = "scan-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "scanner",
@@ -5010,7 +5010,7 @@ dependencies = [
 
 [[package]]
 name = "scanner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -5817,7 +5817,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "sentry",
@@ -6495,7 +6495,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "volumes"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "objc2 0.6.4",

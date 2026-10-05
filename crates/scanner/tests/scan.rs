@@ -266,6 +266,84 @@ fn remove_detaches_a_folder_and_shrinks_its_ancestors() {
 }
 
 #[test]
+fn replace_swaps_in_a_rescanned_folder_and_matches_a_full_scan() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("a/b")).unwrap();
+    write_bytes(&root.path().join("a/b/c.bin"), 100_000);
+    write_bytes(&root.path().join("a/d.bin"), 5_000);
+    write_bytes(&root.path().join("e.bin"), 5_000);
+    let mut tree = scan(root.path());
+    let a = find(&tree, "a");
+    let old_b = find(&tree, "a/b");
+    let old_d = find(&tree, "a/d.bin");
+
+    fs::remove_file(root.path().join("a/d.bin")).unwrap();
+    fs::create_dir(root.path().join("a/g")).unwrap();
+    write_bytes(&root.path().join("a/g/h.bin"), 300_000);
+    write_bytes(&root.path().join("a/b/i.bin"), 20_000);
+    let rescan = scan(&root.path().join("a"));
+    assert!(tree.replace(a, &rescan));
+
+    let fresh = scan(root.path());
+    assert_eq!(tree.allocated(tree.root()), fresh.allocated(fresh.root()));
+    assert_eq!(tree.logical(tree.root()), fresh.logical(fresh.root()));
+    assert_eq!(tree.items(tree.root()), fresh.items(fresh.root()));
+    for path in ["a", "a/b", "a/g", "a/g/h.bin", "a/b/i.bin", "e.bin"] {
+        let (patched, expected) = (find(&tree, path), find(&fresh, path));
+        assert_eq!(tree.allocated(patched), fresh.allocated(expected), "{path}");
+        assert_eq!(tree.path(patched), root.path().join(path));
+    }
+    assert_eq!(tree.find(&root.path().join("a/d.bin")), None);
+    assert_eq!(find(&tree, "a"), a, "the folder keeps its node");
+    assert!(tree.flags(old_b).contains(NodeFlags::REMOVED));
+    assert!(!tree.remove(old_d), "old nodes can't be removed again");
+    assert!(
+        !tree.replace(tree.root(), &rescan),
+        "the root can't be replaced"
+    );
+    assert!(
+        !tree.replace(find(&tree, "e.bin"), &rescan),
+        "files can't be replaced"
+    );
+    assert!(
+        !tree.replace(find(&tree, "a/b"), &rescan),
+        "paths must match"
+    );
+}
+
+/// `cargo test -p scanner --release --test scan -- --ignored --nocapture measure_time`
+#[test]
+#[ignore = "benchmark"]
+fn measure_time_for_ten_thousand_items() {
+    let root = tempfile::tempdir().unwrap();
+    let mut items = Vec::new();
+    for folder in 0..100 {
+        let folder = root.path().join(format!("folder-{folder}"));
+        fs::create_dir(&folder).unwrap();
+        for file in 0..100 {
+            let path = folder.join(format!("file-{file}.bin"));
+            write_bytes(&path, 8_192);
+            items.push(path);
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let measurement = scanner::measure(&items).unwrap();
+    let elapsed = started.elapsed();
+    println!(
+        "{} items, {} bytes freeable, measured in {:.1} ms",
+        measurement.files,
+        measurement.freeable,
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert_eq!(measurement.files, 10_000);
+    assert!(
+        elapsed.as_secs_f64() < 1.0,
+        "Will free takes under a second"
+    );
+}
+
+#[test]
 fn measure_counts_plain_files_in_full() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("a/b")).unwrap();

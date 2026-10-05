@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-05
+
+### Added
+- Rescan This Folder in the right-click menu for folders. Only that folder is scanned again, and the chart, list, suggestions and basket update without a full scan.
+- After moving items to the Trash, the result shows how much the Trash holds in all, since emptying it in Finder deletes everything in it.
+- VoiceOver labels: buttons, check boxes, menus, the capacity bar, the chart, list rows (name, size, notes, and whether the item is in the basket), suggestion cards, the basket, the cleanup result, history and the status bar. Arrow keys in the list move the VoiceOver cursor with the selection.
+- `msc-scan --list-unreadable N` lists folders the scan couldn't read.
+- Opt-in benchmarks for Will free on 10,000 items and for frame time while scanning the home folder.
+
+### Changed
+- Text and button colors meet the WCAG AA contrast ratio (4.5:1) in light and dark appearance, checked by a test. Muted text, accent text, the selected row and the "Safe to delete" and "Review first" colors changed slightly; primary and destructive buttons use darker fills behind their white labels.
+
+### Fixed
+- Will free took about 5 seconds for 10,000 items, because nested items were removed in quadratic time. It now takes about 80 ms.
+
 ## [0.1.0] - 2026-10-05
 
 First release. Apple silicon, macOS 14 or later. The app is signed ad hoc and not notarized, so the first launch needs System Settings › Privacy & Security › Open Anyway.

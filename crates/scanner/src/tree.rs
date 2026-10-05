@@ -346,6 +346,76 @@ impl Tree {
         true
     }
 
+    /// Replaces what is inside the folder `id` with `rescan`, a finished scan of the same folder,
+    /// and corrects every ancestor's totals. The old contents are flagged
+    /// [`NodeFlags::REMOVED`].
+    ///
+    /// Hard links and clones are matched only within `rescan`, so a file sharing data with one
+    /// outside the folder may now be counted twice.
+    ///
+    /// Returns `false`, changing nothing, unless both trees are complete, `id` is a folder other
+    /// than the root that was not removed, and `rescan` is rooted at its path.
+    pub fn replace(&mut self, id: NodeId, rescan: &Tree) -> bool {
+        let Some(parent) = self.parent(id) else {
+            return false;
+        };
+        if !self.complete
+            || !rescan.complete
+            || self.kind(id) != NodeKind::Directory
+            || self.flags(id).contains(NodeFlags::REMOVED)
+            || rescan.root_path != self.path(id)
+        {
+            return false;
+        }
+
+        let mut old = vec![id];
+        while let Some(node) = old.pop() {
+            for child in self.children(node).collect::<Vec<_>>() {
+                self.nodes[child as usize].flags |= NodeFlags::REMOVED;
+                old.push(child);
+            }
+        }
+
+        let base = NodeId::try_from(self.nodes.len()).expect("more than 4 billion entries");
+        let map = |node: NodeId| match node {
+            NO_NODE => NO_NODE,
+            0 => id,
+            node => base + node - 1,
+        };
+        for node in &rescan.nodes[1..] {
+            let name = &rescan.names
+                [node.name_start as usize..node.name_start as usize + usize::from(node.name_len)];
+            let name_start = u32::try_from(self.names.len()).expect("name storage exceeds 4 GiB");
+            self.names.extend_from_slice(name);
+            self.nodes.push(Node {
+                parent: map(node.parent),
+                first_child: map(node.first_child),
+                next_sibling: map(node.next_sibling),
+                name_start,
+                ..node.clone()
+            });
+        }
+
+        let new = &rescan.nodes[0];
+        let target = &mut self.nodes[id as usize];
+        let (old_allocated, old_logical, old_items) =
+            (target.allocated, target.logical, target.items);
+        target.first_child = map(new.first_child);
+        target.allocated = new.allocated;
+        target.logical = new.logical;
+        target.items = new.items;
+        target.flags = new.flags;
+        let mut current = Some(parent);
+        while let Some(ancestor) = current {
+            let node = &mut self.nodes[ancestor as usize];
+            node.allocated = node.allocated.saturating_sub(old_allocated) + new.allocated;
+            node.logical = node.logical.saturating_sub(old_logical) + new.logical;
+            node.items = node.items.saturating_sub(old_items) + new.items;
+            current = self.parent(ancestor);
+        }
+        true
+    }
+
     pub fn path(&self, id: NodeId) -> PathBuf {
         let mut components = Vec::new();
         let mut current = id;

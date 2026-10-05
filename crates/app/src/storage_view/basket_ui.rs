@@ -11,7 +11,7 @@ use cleanup::{
     RunningApps, Safety, Suggestion,
 };
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, MouseDownEvent, Pixels, Point, Render,
+    AnyElement, ClickEvent, Context, FontWeight, MouseDownEvent, Pixels, Point, Render, Role,
     SharedString, Task, Window, anchored, deferred, div, prelude::*, px,
 };
 use scanner::{Measurement, NodeFlags, NodeId};
@@ -56,6 +56,9 @@ pub(super) struct CleanupResult {
     available_before: Option<u64>,
     available_after: Option<u64>,
     snapshots: Option<usize>,
+    /// Everything in the Trash folders the items went to; `None` if they can't be read, which
+    /// needs Full Disk Access.
+    trash_size: Option<u64>,
     deleting: bool,
     deleted: bool,
     delete_failures: usize,
@@ -82,7 +85,7 @@ pub(super) struct Cleanup {
     pub(super) sheet: Option<Sheet>,
     pub(super) menu: Option<ContextMenu>,
     notice: Option<(SharedString, Instant)>,
-    moving: bool,
+    pub(super) moving: bool,
     pub(super) result: Option<CleanupResult>,
     log: Option<OperationLog>,
     history: Vec<LogEntry>,
@@ -541,7 +544,7 @@ impl StorageView {
     }
 
     pub(super) fn move_basket_to_trash(&mut self, cx: &mut Context<Self>) {
-        if self.is_scanning() {
+        if self.is_scanning() || self.folder_rescan.is_some() {
             self.show_notice(
                 "Wait for the scan to finish, or stop it, before moving items",
                 cx,
@@ -565,7 +568,7 @@ impl StorageView {
         let snapshots = self.disk.as_ref().and_then(|disk| disk.snapshots);
         self.cleanup.moving = true;
         self.cleanup._work = Some(cx.spawn(async move |this, cx| {
-            let (outcome, before) = cx
+            let moved = cx
                 .background_executor()
                 .spawn(async move {
                     let before = volumes::volume_at(&root)
@@ -573,11 +576,16 @@ impl StorageView {
                         .map(|volume| volume.available);
                     let running = RunningApps::current();
                     let outcome = cleanup::move_to_trash(&items, &places, &scan_root, &running);
-                    (outcome, before)
+                    let trash_size = trash_size(&outcome);
+                    (outcome, before, trash_size)
                 })
                 .await;
+            let (outcome, before, trash_size) = moved;
             let _ = this.update(cx, |view, cx| {
                 view.finish_move(outcome, will_free, before, snapshots, cx);
+                if let Some(result) = &mut view.cleanup.result {
+                    result.trash_size = trash_size;
+                }
             });
         }));
         cx.notify();
@@ -605,7 +613,15 @@ impl StorageView {
         if let Some(scan) = &self.scan {
             let shared = scan.handle.shared_tree();
             for moved in &outcome.moved {
-                if let Some(node) = moved.node {
+                // A folder rescan since the item was added gives it a new node.
+                let node = {
+                    let tree = shared.read();
+                    moved
+                        .node
+                        .filter(|&node| !tree.flags(node).contains(NodeFlags::REMOVED))
+                        .or_else(|| tree.find(&Places::tree_path(tree.root_path(), &moved.path)))
+                };
+                if let Some(node) = node {
                     shared.remove(node);
                 }
             }
@@ -620,18 +636,24 @@ impl StorageView {
         {
             tracing::warn!(kind = ?error.kind(), "writing the cleanup log failed");
         }
-        self.leave_removed_folders();
         self.cleanup.result = Some(CleanupResult {
             outcome,
             will_free,
             available_before,
             available_after: None,
             snapshots,
+            trash_size: None,
             deleting: false,
             deleted: false,
             delete_failures: 0,
         });
         self.cleanup.sheet = Some(Sheet::Basket);
+        self.tree_changed(cx);
+    }
+
+    /// Refreshes everything that depends on the tree after items were removed or replaced.
+    pub(super) fn tree_changed(&mut self, cx: &mut Context<Self>) {
+        self.leave_removed_folders();
         self.read_disk(cx);
         self.compute_suggestions(cx);
         self.basket_changed(cx);
@@ -715,6 +737,30 @@ impl StorageView {
         }));
         cx.notify();
     }
+}
+
+/// Everything in the Trash folders `outcome` moved items into. Reading a Trash folder needs Full
+/// Disk Access.
+fn trash_size(outcome: &Outcome) -> Option<u64> {
+    let mut folders: Vec<&Path> = outcome
+        .moved
+        .iter()
+        .filter_map(|moved| moved.trashed.as_deref()?.parent())
+        .collect();
+    folders.sort_unstable();
+    folders.dedup();
+    if folders.is_empty() {
+        return None;
+    }
+    let mut total = 0;
+    for folder in folders {
+        let items: Vec<PathBuf> = std::fs::read_dir(folder)
+            .ok()?
+            .filter_map(|entry| Some(entry.ok()?.path()))
+            .collect();
+        total += scanner::measure(&items).ok()?.allocated;
+    }
+    Some(total)
 }
 
 /// Free space once APFS has finished releasing blocks, which happens shortly after deletion.
@@ -839,6 +885,11 @@ impl StorageView {
         };
         div()
             .id(("suggestion", index))
+            .role(Role::Button)
+            .aria_label(format!(
+                "{}, {detail}, {label}",
+                suggestion.category.title()
+            ))
             .flex_none()
             .w(px(220.))
             .h(px(CARD_HEIGHT))
@@ -888,8 +939,15 @@ impl StorageView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let hover = theme.hover;
+        let detail = format!(
+            "{} · {}",
+            format::bytes(place.size),
+            place.kind.open_label()
+        );
         div()
             .id(("managed", index))
+            .role(Role::Button)
+            .aria_label(format!("{}, {detail}, managed by app", place.kind.title()))
             .flex_none()
             .w(px(220.))
             .h(px(CARD_HEIGHT))
@@ -921,11 +979,7 @@ impl StorageView {
                             .text_xs()
                             .text_color(theme.muted)
                             .truncate()
-                            .child(format!(
-                                "{} · {}",
-                                format::bytes(place.size),
-                                place.kind.open_label()
-                            )),
+                            .child(detail),
                     )
                     .child(badge("Managed by app", theme.muted)),
             )
@@ -961,6 +1015,8 @@ impl StorageView {
         let accent = theme.accent;
         div()
             .id("basket-bar")
+            .role(Role::Group)
+            .aria_label(summary.clone())
             .flex()
             .items_center()
             .gap_3()
@@ -1001,6 +1057,9 @@ impl StorageView {
         let entry = |id: &'static str, label: SharedString, enabled: bool| {
             div()
                 .id(id)
+                .role(Role::MenuItem)
+                .aria_label(label.clone())
+                .when(!enabled, |this| this.aria_description("Unavailable"))
                 .px_3()
                 .py_1()
                 .rounded_sm()
@@ -1014,6 +1073,7 @@ impl StorageView {
         let item = menu.item;
         let mut list = div()
             .id("context-menu")
+            .role(Role::Menu)
             .occlude()
             .min_w(px(220.))
             .max_w(px(360.))
@@ -1070,16 +1130,29 @@ impl StorageView {
             }
         }
         if menu.folder {
-            list = list.child(
-                entry("menu-open", "Open".into(), true).on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        this.cleanup.menu = None;
-                        if let Item::Node(id) = item {
-                            this.open_folder(id, cx);
-                        }
-                    },
-                )),
-            );
+            let can_rescan = self.can_rescan_folder();
+            list = list
+                .child(
+                    entry("menu-open", "Open".into(), true).on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.cleanup.menu = None;
+                            if let Item::Node(id) = item {
+                                this.open_folder(id, cx);
+                            }
+                        },
+                    )),
+                )
+                .child(
+                    entry("menu-rescan", "Rescan This Folder".into(), can_rescan).on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.cleanup.menu = None;
+                            if let (Item::Node(id), true) = (item, this.can_rescan_folder()) {
+                                this.rescan_folder(id, cx);
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                );
         }
         list = list
             .child(
@@ -1125,6 +1198,8 @@ impl StorageView {
         let card =
             div()
                 .id("sheet")
+                .role(Role::Dialog)
+                .aria_label(title.clone())
                 .occlude()
                 .w(px(700.))
                 .max_h(px(600.))
@@ -1226,6 +1301,14 @@ impl StorageView {
             .flex_col()
             .child(
                 div()
+                    .id("suggestion-reason")
+                    .role(Role::Group)
+                    .aria_label(
+                        std::iter::once(suggestion.category.reason().to_string())
+                            .chain(suggestion.skipped.iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
                     .px_4()
                     .py_2()
                     .flex()
@@ -1257,7 +1340,7 @@ impl StorageView {
                         primary_button(
                             "add-all",
                             "Add all to basket",
-                            theme.accent,
+                            theme.accent_fill,
                             !all_in && !suggestion.items.is_empty(),
                         )
                         .on_click(cx.listener(
@@ -1386,8 +1469,16 @@ impl StorageView {
             .flex_col()
             .child(body)
             .when(count > 0, |this| {
+                let spoken = std::iter::once(will_free.clone())
+                    .chain(details.iter().cloned())
+                    .chain(std::iter::once(footer_note.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(". ");
                 this.child(
                     div()
+                        .id("basket-footer")
+                        .role(Role::Group)
+                        .aria_label(spoken)
                         .px_4()
                         .py_3()
                         .border_t_1()
@@ -1419,7 +1510,7 @@ impl StorageView {
                                         } else {
                                             format!("Move {} to Trash", format::items(count as u64))
                                         },
-                                        theme.destructive,
+                                        theme.destructive_fill,
                                         can_move,
                                     )
                                     .on_click(cx.listener(
@@ -1458,25 +1549,32 @@ impl StorageView {
             .flex()
             .flex_col()
             .gap_1p5();
+        let mut spoken = Vec::new();
         if moved > 0 {
-            section = section.child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
+            let text = format!(
                 "Moved {} ({}) to the Trash",
                 format::items(moved as u64),
                 format::bytes(moved_bytes)
-            )));
+            );
+            spoken.push(format!("{text}."));
+            section = section.child(div().font_weight(FontWeight::SEMIBOLD).child(text));
         }
         if !result.outcome.failed.is_empty() {
-            section = section.child(div().text_color(theme.destructive).child(format!(
+            let text = format!(
                 "{} stayed where they were:",
                 format::items(result.outcome.failed.len() as u64)
-            )));
+            );
+            spoken.push(text.clone());
+            section = section.child(div().text_color(theme.destructive).child(text));
             for failed in result.outcome.failed.iter().take(20) {
+                let text = format!("{} · {}", file_name(&failed.path), failed.reason);
+                spoken.push(format!("{text}."));
                 section = section.child(
                     div()
                         .text_xs()
                         .text_color(theme.muted)
                         .truncate()
-                        .child(format!("{} · {}", file_name(&failed.path), failed.reason)),
+                        .child(text),
                 );
             }
         }
@@ -1503,6 +1601,7 @@ impl StorageView {
                     format::items(result.delete_failures as u64)
                 ));
             }
+            spoken.push(text.clone());
             section = section.child(div().child(text));
             if let (Some(gained), Some(expected)) = (gained, result.will_free)
                 && gained.saturating_mul(10) < expected.saturating_mul(9)
@@ -1512,6 +1611,7 @@ impl StorageView {
                 } else {
                     "Less than expected: some data is still shared with clones, or other apps wrote to the disk meanwhile."
                 };
+                spoken.push(why.to_string());
                 section = section.child(div().text_xs().text_color(theme.muted).child(why));
             }
         } else if trashed > 0 {
@@ -1519,12 +1619,19 @@ impl StorageView {
                 .will_free
                 .map(|bytes| format!(" (frees about {})", format::bytes(bytes)))
                 .unwrap_or_default();
+            let still = "They still take up space until the Trash is emptied. You can put them back from the Trash in Finder.";
+            let trash_note = result.trash_size.map(|size| {
+                format!(
+                    "The Trash holds {} in all. Emptying it in Finder deletes everything in it, not just these items.",
+                    format::bytes(size)
+                )
+            });
+            spoken.push(still.to_string());
+            spoken.extend(trash_note.clone());
             section = section
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted)
-                        .child("They still take up space until the Trash is emptied. You can put them back from the Trash in Finder."),
+                .child(div().text_xs().text_color(theme.muted).child(still))
+                .children(
+                    trash_note.map(|note| div().text_xs().text_color(theme.muted).child(note)),
                 )
                 .child(
                     div().flex().child(
@@ -1538,14 +1645,19 @@ impl StorageView {
                                     format::items(trashed as u64)
                                 )
                             },
-                            theme.destructive,
+                            theme.destructive_fill,
                             !result.deleting,
                         )
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.delete_trashed(cx))),
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.delete_trashed(cx)),
+                        ),
                     ),
                 );
         }
         section
+            .id("cleanup-result")
+            .role(Role::Status)
+            .aria_label(spoken.join(" "))
     }
 
     fn render_history_sheet(&self, theme: &Theme) -> AnyElement {
@@ -1565,7 +1677,7 @@ impl StorageView {
                     "Nothing cleaned yet. Every cleanup is recorded here, on this Mac only.",
                 ));
         }
-        for entry in self.cleanup.history.iter().take(SHEET_ROWS) {
+        for (index, entry) in self.cleanup.history.iter().take(SHEET_ROWS).enumerate() {
             let action = match entry.action {
                 Action::MovedToTrash => "Moved to Trash",
                 Action::DeletedFromTrash => "Deleted from Trash",
@@ -1579,8 +1691,12 @@ impl StorageView {
             if entry.failed > 0 {
                 summary.push_str(&format!(" · {} failed", entry.failed));
             }
+            let time = format_time(entry.time);
             rows = rows.child(
                 div()
+                    .id(("history", index))
+                    .role(Role::ListItem)
+                    .aria_label(format!("{time} · {summary}"))
                     .flex()
                     .flex_col()
                     .gap_0p5()
@@ -1588,7 +1704,7 @@ impl StorageView {
                         div()
                             .flex()
                             .gap_2()
-                            .child(div().text_color(theme.muted).child(format_time(entry.time)))
+                            .child(div().text_color(theme.muted).child(time))
                             .child(summary),
                     )
                     .children(entry.paths.iter().take(3).map(|path| {
@@ -1619,8 +1735,15 @@ fn sheet_row(
     size: u64,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
+    let name = file_name(path);
+    let detail = match note {
+        Some(note) => format!("{note} · {}", display_path(path)),
+        None => display_path(path),
+    };
     div()
         .id(id)
+        .role(Role::ListItem)
+        .aria_label(format!("{name}, {}, {detail}", format::bytes(size)))
         .flex()
         .items_center()
         .gap_3()
@@ -1633,16 +1756,13 @@ fn sheet_row(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().truncate().child(file_name(path)))
+                .child(div().truncate().child(name))
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted)
                         .truncate()
-                        .child(match note {
-                            Some(note) => format!("{note} · {}", display_path(path)),
-                            None => display_path(path),
-                        }),
+                        .child(detail),
                 ),
         )
         .child(
@@ -1671,4 +1791,45 @@ fn format_time(seconds: u64) -> String {
         tm.tm_hour,
         tm.tm_min
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use cleanup::{Category, Moved};
+
+    use super::*;
+
+    #[test]
+    fn trash_size_counts_everything_in_the_trash_folders_used() {
+        let trash = tempfile::tempdir().unwrap();
+        fs::write(trash.path().join("moved.bin"), vec![1u8; 300_000]).unwrap();
+        fs::create_dir(trash.path().join("older")).unwrap();
+        fs::write(trash.path().join("older/file.bin"), vec![2u8; 200_000]).unwrap();
+        let moved = |trashed: Option<PathBuf>| Moved {
+            path: PathBuf::from("/Users/test/moved.bin"),
+            trashed,
+            node: None,
+            category: Category::Chosen,
+            size: 0,
+        };
+        let outcome = |moved| Outcome {
+            moved,
+            failed: Vec::new(),
+        };
+
+        let expected =
+            scanner::measure(&[trash.path().join("moved.bin"), trash.path().join("older")])
+                .unwrap()
+                .allocated;
+        let both = outcome(vec![
+            moved(Some(trash.path().join("moved.bin"))),
+            moved(Some(trash.path().join("older"))),
+        ]);
+        assert_eq!(trash_size(&both), Some(expected));
+        assert_eq!(trash_size(&outcome(vec![moved(None)])), None);
+        let unreadable = outcome(vec![moved(Some(PathBuf::from("/nonexistent/.Trash/x")))]);
+        assert_eq!(trash_size(&unreadable), None);
+    }
 }

@@ -1,6 +1,12 @@
 //! Small controls shared by every window.
+//!
+//! Labels are plain strings, which GPUI leaves out of the accessibility tree,
+//! so each control names itself with `aria_label` instead.
 
-use gpui::{Div, ElementId, Rgba, SharedString, Stateful, div, prelude::*, px, white};
+use gpui::{
+    Div, ElementId, FontWeight, Rgba, Role, SharedString, Stateful, Toggled, div, prelude::*, px,
+    white,
+};
 
 use crate::theme::Theme;
 
@@ -10,8 +16,11 @@ pub fn button(
     theme: &Theme,
 ) -> Stateful<Div> {
     let hover = theme.hover;
+    let label = label.into();
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
         .px_3()
         .py_1()
         .rounded_md()
@@ -21,7 +30,7 @@ pub fn button(
         .cursor_pointer()
         .whitespace_nowrap()
         .hover(move |style| style.bg(hover))
-        .child(label.into())
+        .child(label)
 }
 
 pub fn primary_button(
@@ -30,8 +39,12 @@ pub fn primary_button(
     color: Rgba,
     enabled: bool,
 ) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .when(!enabled, |this| this.aria_description("Unavailable"))
         .px_3()
         .py_1()
         .rounded_md()
@@ -40,7 +53,27 @@ pub fn primary_button(
         .bg(color)
         .when(enabled, |this| this.cursor_pointer())
         .when(!enabled, |this| this.opacity(0.45))
-        .child(label.into())
+        .child(label)
+}
+
+/// Text that screen readers read.
+pub fn label(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Stateful<Div> {
+    let text = text.into();
+    div()
+        .id(id)
+        .role(Role::Label)
+        .aria_label(text.clone())
+        .child(text)
+}
+
+pub fn heading(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Stateful<Div> {
+    let text = text.into();
+    div()
+        .id(id)
+        .role(Role::Heading)
+        .aria_label(text.clone())
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(text)
 }
 
 pub fn badge(label: impl Into<SharedString>, color: Rgba) -> impl IntoElement {
@@ -62,6 +95,7 @@ pub fn checkbox(
     checked: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
+    let label = label.into();
     let mark = div()
         .flex_none()
         .size(px(16.))
@@ -72,8 +106,8 @@ pub fn checkbox(
         .justify_center()
         .text_xs()
         .when(checked, |this| {
-            this.bg(theme.accent)
-                .border_color(theme.accent)
+            this.bg(theme.accent_fill)
+                .border_color(theme.accent_fill)
                 .text_color(white())
                 .child("✓")
         })
@@ -82,10 +116,17 @@ pub fn checkbox(
         });
     div()
         .id(id)
+        .role(Role::CheckBox)
+        .aria_label(label.clone())
+        .aria_toggled(if checked {
+            Toggled::True
+        } else {
+            Toggled::False
+        })
         .flex()
         .items_center()
         .gap_2()
         .cursor_pointer()
         .child(mark)
-        .child(label.into())
+        .child(label)
 }

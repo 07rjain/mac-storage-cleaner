@@ -40,6 +40,11 @@ impl SharedTree {
     pub fn remove(&self, id: NodeId) -> bool {
         self.0.write().remove(id)
     }
+
+    /// See [`Tree::replace`].
+    pub fn replace(&self, id: NodeId, rescan: &Tree) -> bool {
+        self.0.write().replace(id, rescan)
+    }
 }
 
 #[derive(Debug, Clone)]

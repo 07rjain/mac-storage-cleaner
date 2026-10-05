@@ -2,11 +2,11 @@
 
 use std::process::Command;
 
-use gpui::{Context, FontWeight, Render, SharedString, Subscription, Window, div, prelude::*};
+use gpui::{Context, ElementId, Render, Role, SharedString, Subscription, Window, div, prelude::*};
 
 use crate::settings::{self, Settings};
 use crate::theme::Theme;
-use crate::widgets::{badge, button, checkbox};
+use crate::widgets::{badge, button, checkbox, heading, label};
 use crate::{ToggleCrashReports, access};
 
 pub struct Preferences {
@@ -37,8 +37,8 @@ fn section(title: &'static str, body: impl Into<SharedString>, theme: &Theme) ->
         .pb_4()
         .border_b_1()
         .border_color(theme.border)
-        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-        .child(div().text_color(theme.muted).child(body.into()))
+        .child(heading(title, title))
+        .child(label(ElementId::Name(format!("{title} body").into()), body).text_color(theme.muted))
 }
 
 impl Render for Preferences {
@@ -58,7 +58,7 @@ impl Render for Preferences {
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleCrashReports), cx)),
         );
 
-        let (label, color) = if self.full_disk_access {
+        let (state, color) = if self.full_disk_access {
             ("On", theme.safe)
         } else {
             ("Off", theme.review)
@@ -74,7 +74,13 @@ impl Render for Preferences {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(badge(label, color))
+                .child(
+                    div()
+                        .id("full-disk-access-status")
+                        .role(Role::Label)
+                        .aria_label(format!("Full Disk Access is {}", state.to_lowercase()))
+                        .child(badge(state, color)),
+                )
                 .child(
                     button("open-full-disk-access", "Open Privacy & Security…", &theme)
                         .on_click(|_, _, cx| access::open_settings(cx)),
@@ -85,15 +91,13 @@ impl Render for Preferences {
             .flex()
             .flex_col()
             .gap_1p5()
+            .child(heading("history-title", "Cleanup history"))
             .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Cleanup history"),
-            )
-            .child(
-                div()
-                    .text_color(theme.muted)
-                    .child("Every cleanup is logged on this Mac only, with the paths it moved."),
+                label(
+                    "history-body",
+                    "Every cleanup is logged on this Mac only, with the paths it moved.",
+                )
+                .text_color(theme.muted),
             )
             .child(
                 div().flex().child(match log {
@@ -106,10 +110,9 @@ impl Render for Preferences {
                             }
                         })
                         .into_any_element(),
-                    None => div()
+                    None => label("history-empty", "Nothing has been cleaned yet.")
                         .text_xs()
                         .text_color(theme.muted)
-                        .child("Nothing has been cleaned yet.")
                         .into_any_element(),
                 }),
             );
