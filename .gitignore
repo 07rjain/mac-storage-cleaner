@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+
+/target
+*.dSYM
+.DS_Store

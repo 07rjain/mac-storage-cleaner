@@ -1,0 +1,26 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mac-storage-cleaner"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+scanner.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+telemetry.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+volumes.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

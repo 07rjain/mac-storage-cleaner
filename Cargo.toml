@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/app", "crates/scan-cli", "crates/scanner", "crates/telemetry", "crates/volumes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+# Upstream GPUI is pre-1.0. Bump this pin on purpose, in its own change, with a changelog entry.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "279fe070bb389b79652e52065b2f001edcc0b11b", default-features = false, features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "279fe070bb389b79652e52065b2f001edcc0b11b", features = ["font-kit"] }
+
+scanner = { path = "crates/scanner" }
+telemetry = { path = "crates/telemetry" }
+volumes = { path = "crates/volumes" }
+
+crossbeam-channel = "0.5"
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSValue"] }
+parking_lot = "0.12"
+regex = "1.13"
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "transport", "tracing"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
