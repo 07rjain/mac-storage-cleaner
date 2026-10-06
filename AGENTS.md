@@ -49,8 +49,8 @@ Opt-in tests that scan the home folder or mount a disk image are `#[ignore]`. Do
 `CHANGELOG.md` follows Keep a Changelog and Semantic Versioning. The app version is `workspace.package.version` in `Cargo.toml`.
 
 - User-visible changes, dependency pins, Sentry setup, and safety-rule changes get a line under `## [Unreleased]` in the same change.
-- A release moves `Unreleased` into `## [x.y.z] - YYYY-MM-DD`. Use that same version for the bundle, the git tag `vX.Y.Z`, and the Sentry release name `mac-storage-cleaner@X.Y.Z`.
-- Do not tag or publish a release unless the user asks.
+- A release moves `Unreleased` into `## [x.y.z] - YYYY-MM-DD`. Use that same version for the bundle, the git tag `vX.Y.Z`, the GitHub release, and the Sentry release name `mac-storage-cleaner@X.Y.Z`.
+- When the user asks to update the DMG, ship a build, or make Check for Updates see a version, publish the GitHub release in the same turn. Do not tag or publish for other work unless the user asks.
 
 ## Error handling and Sentry
 
@@ -64,10 +64,10 @@ Opt-in tests that scan the home folder or mount a disk image are `#[ignore]`. Do
 ## DMG and install
 
 - `./scripts/bundle.sh` writes `dist/Mac-Storage-Cleaner-<version>.dmg` and `dist/mac-storage-cleaner.dSYM`. `dist/` is gitignored. The script signs ad hoc with the hardened runtime. It is not notarized, so first launch needs System Settings › Privacy & Security › Open Anyway.
-- Check for Updates reads `https://api.github.com/repos/07rjain/mac-storage-cleaner/releases/latest` with no token. It only opens `https://github.com/07rjain/mac-storage-cleaner/` URLs. A private repository returns 404, so the repo has to be public before the button can see a release. Do not embed a GitHub token to work around that.
+- Check for Updates reads `https://api.github.com/repos/07rjain/mac-storage-cleaner/releases/latest` with no token. It only opens `https://github.com/07rjain/mac-storage-cleaner/` URLs. It offers the release only when that tag is a higher `major.minor.patch` than the running app. A private repository returns 404, so the repo has to stay public. Do not embed a GitHub token to work around that.
+- A DMG update publishes tag `vX.Y.Z` and a GitHub release titled `X.Y.Z` whose asset is `dist/Mac-Storage-Cleaner-<version>.dmg`. The notes are the changelog sections since the previous GitHub release, plus the ad-hoc install note. Target the commit that was built. Then confirm an anonymous request to `releases/latest` returns that tag and a `.dmg` URL under `https://github.com/07rjain/mac-storage-cleaner/`. The README links to the latest release. Do not commit the DMG.
 - Ad-hoc signatures change every build. Full Disk Access must be granted again after updating.
 - `./scripts/upload-dsym.sh` creates the Sentry release and uploads the dSYM from `dist/`. Run it only when the user asks to publish symbols. It needs `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, and `SENTRY_PROJECT`.
-- A GitHub release attaches `dist/Mac-Storage-Cleaner-<version>.dmg` to tag `vX.Y.Z`. The README links to the latest release. Do not commit the DMG.
 - To try a build locally: `hdiutil attach` the DMG, copy `Mac Storage Cleaner.app` to `/Applications`, `xattr -cr` the copy, then `open` it. Quit the running app first.
 
 ## Safety and scope
