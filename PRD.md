@@ -41,7 +41,7 @@ The product has three promises:
 - Deleting local snapshots or forcing a purge.
 - Any iCloud feature (deferred to Future, see section 13): showing what is only in iCloud, evicting or downloading files, toggling Optimize Mac Storage, or analyzing the iCloud account or quota.
 - Opening up the Photos library, iOS backups, Mail or Messages data.
-- Uninstaller, duplicate finder, "optimize", memory cleaning, malware scanning.
+- Uninstalling an app that is still installed. Leftovers of bundle IDs not found under Applications, put back, project cards, and exact copies are specified in `CLEANUP_PRD.md`. Similar photos, memory cleaning, and malware scanning stay out.
 - Permanent delete as a default action.
 - Mac App Store distribution (sandboxing blocks the scanning this product needs).
 - Menu bar or background monitoring.
@@ -95,7 +95,10 @@ Licensing rules:
 
 - **Capacity bar (top, always visible):** used, purgeable and free space for the selected volume. After cleanup it shows the before and after numbers.
 - **Sunburst (center):** the center is the current folder; each ring is one level deeper. Clicking a slice zooms in, and clicking the center goes up. At most 6 rings are shown. Slices narrower than about 0.5° are merged into one "Smaller items" slice.
-- **Treemap (v1.1):** the current folder fills the chart as nested rectangles, sized by allocated space and colored by file type. Switch with View › As Treemap (⌥⌘2) or the Sunburst / Treemap control next to the breadcrumb. Rectangles too small to draw are merged into "Smaller items".
+- **Treemap (v1.1):** the current folder fills the chart as nested rectangles, sized by allocated space and colored by file type. Switch with View › As Treemap (⌥⌘2) or the control next to the breadcrumb. Rectangles too small to draw are merged into "Smaller items".
+- **Icicle:** the same levels as the sunburst, drawn as horizontal bars. The top bar is the current folder and goes up. ⌥⌘3.
+- **Tree:** an outline of the current folder. The arrow, or the Right arrow key, expands a folder without leaving it; Right arrow again opens it. Folders with more than 8,000 entries open instead of expanding. ⌥⌘4.
+- **File types:** bars of space by file kind inside the current folder. The largest child folders are opened one level; the rest stay in one Folders bar. ⌥⌘5.
 - **Accounting slices at the root:** other APFS volumes, purgeable space, local snapshots, and "Not measured" (protected or unreadable areas). The "Not measured" slice offers the Full Disk Access prompt.
 - **Files stored only in iCloud** count at their local size, which is close to zero. A separate iCloud view is deferred to Future.
 - **Side list:** the children of the current folder, sorted by size, kept in sync with the chart on hover and selection. After a later scan of the same place, folders that grew or shrank by at least 1 MB show a note, and the status bar shows the total change since last scan.
@@ -174,8 +177,11 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 | `~/Library/Caches/<app>` | Review only | At least 1 MB, owning app not running, never `com.apple.*` |
 | `~/Library/Logs` | Review only | None |
 | Large files (≥ 1 GB) | Review only | Never preselected |
+| Leftover files for a bundle ID not found under Applications | Review only | Caches, Application Support, the container folder, saved application state, and HTTP storage. Not Group Containers, LaunchAgents, Preferences, or `com.apple`. The container folder can be added only with a proof that is checked again when it is added and when it is moved |
 
 Suggestions never overlap: an item claimed by one category is not offered by another.
+
+The next cleanup work (leftovers, put back, one card per project, exact copies) is specified in `CLEANUP_PRD.md`. It does not replace this section.
 
 ### 8.2 Show, but don't clean
 Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` and VM images. Each shows its size and a button that opens the right app or settings pane.
@@ -183,7 +189,7 @@ Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` 
 ### 8.3 Safety rules
 - Suggestions come from an allow-list. Anything the app can't classify is never suggested.
 - Personal files are never preselected.
-- Refused at all times: `/System`, `/Library`, `/private`, `/Applications` and `~/Applications` (v1), other users' folders, the home folder itself and its standard folders (Desktop, Documents, Downloads and so on), `~/Library` and its direct children, the Trash, iCloud Drive and other cloud storage folders, keychains and preferences, Mail, Messages and Photos data, app containers themselves, any package internals (`.photoslibrary`, `.app`, `MobileSync/Backup` contents), external volume roots and their system folders, any dataless entry, and any symlink that resolves outside the scanned area.
+- Refused at all times: `/System`, `/Library`, `/private`, `/Applications` and `~/Applications` (v1), other users' folders, the home folder itself and its standard folders (Desktop, Documents, Downloads and so on), `~/Library` and its direct children, the Trash, iCloud Drive and other cloud storage folders, keychains and preferences, Mail, Messages and Photos data, app containers themselves, any package internals (`.photoslibrary`, `.app`, `MobileSync/Backup` contents), external volume roots and their system folders, any dataless entry, and any symlink that resolves outside the scanned area. `CLEANUP_PRD.md` section 5.3 is the only exception: one third-party `~/Library/Containers/<bundle-id>` folder, and only while a fresh proof says that bundle was absent from a complete Applications inventory. Group Containers stay refused. The exception is checked again when the item is added and when it is moved, not by weakening `safety::check` for every container.
 - Permanent deletion only acts on items inside a Trash folder.
 - A cache is skipped if its owning app is running.
 - At confirmation time, each path is re-checked (still exists, same file ID, same type) before it is moved.
@@ -307,8 +313,8 @@ M3 results (2026-10-05):
 
 ### 11.3 Data flow
 1. `scanner` workers write into the arena and send progress batches over a channel.
-2. The `app` view polls on a timer, rebuilds the visible chart (sunburst or treemap) from the current folder, and repaints.
-3. Clicks are hit-tested with polar math (angle and radius) instead of per-slice geometry. The treemap hit-tests nested rectangles, innermost tile wins.
+2. The `app` view polls on a timer, rebuilds the visible chart (sunburst, treemap, icicle, tree, or file types) from the current folder, and repaints.
+3. Clicks are hit-tested with polar math (angle and radius) instead of per-slice geometry. The treemap hit-tests nested rectangles, innermost tile wins. The icicle hit-tests horizontal bars.
 4. After a scan finishes, FSEvents batches are coalesced and the changed folders are replaced in the tree.
 5. `cleanup` reads the arena for suggestions and the basket, and re-checks paths on disk before moving.
 
@@ -330,6 +336,7 @@ M3 results (2026-10-05):
 | M3 Cleanup | Suggestions, basket, Will free, Trash, operation log | Will-free test passes; refused paths cannot be added. Done 2026-10-05, see 10.2 |
 | M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, ad-hoc signing, DMG, dSYM upload | DMG installs and runs on macOS 14 or later (notarization waits for a Developer ID). Done 2026-10-05: the DMG's app passes `codesign --verify --strict` and runs after being copied out; tested on the development Mac only, not on a clean macOS 14 machine |
 | v1.1 | FSEvents refresh, treemap tab, native crash capture, scan comparison | Done 2026-10-06 as 0.2.0. iCloud, Developer ID signing and notarization stay deferred. |
+| Cleanup next | Leftovers, put back, project cards, exact copies | Leftovers are in the app. Put back, project cards, and exact copies are still specified in `CLEANUP_PRD.md` and not started. |
 | Future: iCloud | "In iCloud, not on this Mac" ring at full logical size, iCloud Drive breakdown, evict and download actions | Separate PRD update |
 
 ## 14. Risks
@@ -351,6 +358,7 @@ Decided (2026-10-05):
 - App name "Mac Storage Cleaner", bundle ID `io.github.07rjain.mac-storage-cleaner`.
 - 0.1.0 ships as an ad-hoc signed DMG without notarization.
 - 0.2.0 (v1.1): treemap in addition to sunburst; native crash dumps are addresses and library IDs only; scan comparison is notes in the list and status, not a separate chart. iCloud, signing and notarization remain deferred.
+- 2026-10-06: the next cleanup is `CLEANUP_PRD.md`, revised the same day after review. Installed apps are not uninstalled. Preferences, Group Containers, and LaunchAgents stay refused. A container folder is allowed only with a proof that is rechecked at add and confirm. Nothing new is preselected. Build-folder cards regroup the current rules and do not add a running-tool check.
 
 Open:
 1. Whether the app is free, paid, or open source.

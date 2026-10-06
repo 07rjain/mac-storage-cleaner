@@ -13,6 +13,9 @@ pub enum Chart {
     #[default]
     Sunburst,
     Treemap,
+    Icicle,
+    Tree,
+    Types,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

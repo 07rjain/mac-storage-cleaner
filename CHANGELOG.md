@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-06
+
+### Added
+
+- Leftover files for bundle IDs that were not found under Applications on this Mac. The card is review-only and can include a third-party app container only while a fresh check still shows that app is absent. Group Containers, LaunchAgents, and Preferences stay refused.
+
+## [0.2.3] - 2026-10-06
+
+### Added
+
+- Icicle chart, an expandable tree, and file-type bars. Switch from the View menu or the control next to the breadcrumb: Icicle (⌥⌘3), Tree (⌥⌘4), File Types (⌥⌘5). In the tree, the arrow or the Right arrow key expands a folder; Right arrow again opens it.
+
+## [0.2.2] - 2026-10-06
+
+### Added
+- Check for Updates in the app menu and the About window. It reads the latest GitHub release and, when a newer one exists, opens that disk image. The repository has to be public; no token is built into the app.
+
+## [0.2.1] - 2026-10-06
+
+### Fixed
+- Live refresh no longer crashes after the scanned folder changes. Updating the chart was keeping every previous copy of the tree until the name storage overflowed and the app aborted.
+
 ## [0.2.0] - 2026-10-06
 
 ### Added

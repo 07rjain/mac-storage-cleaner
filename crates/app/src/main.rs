@@ -3,6 +3,7 @@ mod access;
 mod compare;
 mod file_types;
 mod format;
+mod icicle;
 mod model;
 mod preferences;
 mod settings;
@@ -10,6 +11,8 @@ mod storage_view;
 mod sunburst;
 mod theme;
 mod treemap;
+mod types;
+mod update;
 mod welcome;
 mod widgets;
 
@@ -27,9 +30,9 @@ use crate::about::About;
 use crate::preferences::Preferences;
 use crate::settings::{Chart, Settings};
 use crate::storage_view::{
-    AddToBasket, Dismiss, EmptyBasket, GoToTop, GoUp, OpenSelected, QuickLook, Rescan,
-    RevealInFinder, ReviewBasket, ScanFolder, ScanHomeFolder, ScanStartupDisk, Scope, SelectNext,
-    SelectPrevious, ShowHistory, StopScan, StorageView,
+    AddToBasket, CollapseOrUp, Dismiss, EmptyBasket, ExpandOrOpen, GoToTop, GoUp, OpenSelected,
+    QuickLook, Rescan, RevealInFinder, ReviewBasket, ScanFolder, ScanHomeFolder, ScanStartupDisk,
+    Scope, SelectNext, SelectPrevious, ShowHistory, StopScan, StorageView,
 };
 use crate::welcome::Welcome;
 
@@ -43,10 +46,14 @@ actions!(
     [
         Quit,
         ShowAbout,
+        CheckForUpdates,
         ShowSettings,
         ToggleCrashReports,
         ShowSunburst,
-        ShowTreemap
+        ShowTreemap,
+        ShowIcicle,
+        ShowTree,
+        ShowTypes
     ]
 );
 
@@ -118,8 +125,16 @@ fn init(settings: Settings, cx: &mut App) {
     cx.on_action(|_: &ShowTreemap, cx| {
         settings::update(cx, |settings| settings.chart = Chart::Treemap)
     });
+    cx.on_action(|_: &ShowIcicle, cx| {
+        settings::update(cx, |settings| settings.chart = Chart::Icicle)
+    });
+    cx.on_action(|_: &ShowTree, cx| settings::update(cx, |settings| settings.chart = Chart::Tree));
+    cx.on_action(|_: &ShowTypes, cx| {
+        settings::update(cx, |settings| settings.chart = Chart::Types)
+    });
     cx.on_action(|_: &ShowSettings, cx| open_settings_window(cx));
-    cx.on_action(|_: &ShowAbout, cx| open_about_window(cx));
+    cx.on_action(|_: &ShowAbout, cx| open_about_window(false, cx));
+    cx.on_action(|_: &CheckForUpdates, cx| open_about_window(true, cx));
     cx.bind_keys(key_bindings());
 }
 
@@ -200,17 +215,37 @@ fn open_settings_window(cx: &mut App) {
     }
 }
 
-fn open_about_window(cx: &mut App) {
-    if activate(cx.global::<Panels>().about, cx) {
-        return;
+fn open_about_window(check: bool, cx: &mut App) {
+    if let Some(handle) = cx
+        .global::<Panels>()
+        .about
+        .and_then(|handle| handle.downcast::<About>())
+    {
+        let updated = handle.update(cx, |about, window: &mut gpui::Window, cx| {
+            window.activate_window();
+            if check {
+                about.check(cx);
+            }
+        });
+        if updated.is_ok() {
+            return;
+        }
     }
     let options = window_options(
         &format!("About {APP_NAME}"),
-        size(px(420.), px(240.)),
+        size(px(480.), px(320.)),
         false,
         cx,
     );
-    match cx.open_window(options, |_, cx| cx.new(|_| About)) {
+    match cx.open_window(options, |_, cx| {
+        cx.new(|cx| {
+            let mut about = About::new();
+            if check {
+                about.check(cx);
+            }
+            about
+        })
+    }) {
         Ok(handle) => cx.global_mut::<Panels>().about = Some(handle.into()),
         Err(error) => open_failed("about", error, cx),
     }
@@ -224,9 +259,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", SelectNext, view),
         KeyBinding::new("up", SelectPrevious, view),
         KeyBinding::new("enter", OpenSelected, view),
-        KeyBinding::new("right", OpenSelected, view),
+        KeyBinding::new("right", ExpandOrOpen, view),
         KeyBinding::new("cmd-down", OpenSelected, view),
-        KeyBinding::new("left", GoUp, view),
+        KeyBinding::new("left", CollapseOrUp, view),
         KeyBinding::new("backspace", GoUp, view),
         KeyBinding::new("cmd-up", GoUp, view),
         KeyBinding::new("cmd-shift-up", GoToTop, view),
@@ -239,6 +274,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-o", ScanFolder, view),
         KeyBinding::new("alt-cmd-1", ShowSunburst, None),
         KeyBinding::new("alt-cmd-2", ShowTreemap, None),
+        KeyBinding::new("alt-cmd-3", ShowIcicle, None),
+        KeyBinding::new("alt-cmd-4", ShowTree, None),
+        KeyBinding::new("alt-cmd-5", ShowTypes, None),
         KeyBinding::new("cmd-backspace", AddToBasket, view),
         KeyBinding::new("cmd-b", ReviewBasket, view),
         KeyBinding::new("space", QuickLook, view),
@@ -250,6 +288,7 @@ pub fn menus(settings: &Settings) -> Vec<Menu> {
     vec![
         Menu::new(APP_NAME).items([
             MenuItem::action(format!("About {APP_NAME}"), ShowAbout),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Settings…", ShowSettings),
             MenuItem::action("Send Crash Reports", ToggleCrashReports)
@@ -269,6 +308,9 @@ pub fn menus(settings: &Settings) -> Vec<Menu> {
             MenuItem::action("As Sunburst", ShowSunburst)
                 .checked(settings.chart == Chart::Sunburst),
             MenuItem::action("As Treemap", ShowTreemap).checked(settings.chart == Chart::Treemap),
+            MenuItem::action("As Icicle", ShowIcicle).checked(settings.chart == Chart::Icicle),
+            MenuItem::action("As Tree", ShowTree).checked(settings.chart == Chart::Tree),
+            MenuItem::action("As File Types", ShowTypes).checked(settings.chart == Chart::Types),
         ]),
         Menu::new("Go").items([
             MenuItem::action("Open Folder", OpenSelected),

@@ -131,6 +131,7 @@ fn free_space_gained_matches_will_free() {
         basket.places(),
         basket.scan_root(),
         &RunningApps::default(),
+        &cleanup::Inventory::known(Vec::<String>::new()),
     );
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
     let trashed: Vec<PathBuf> = outcome

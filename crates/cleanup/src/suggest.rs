@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use scanner::{NodeFlags, NodeId, NodeKind, Tree};
 
-use crate::{Category, Places, RunningApps, Safety, safety};
+use crate::{Category, Inventory, LeftoverProof, Places, RunningApps, Safety, managed, safety};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const INSTALLER_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -52,6 +52,46 @@ const PACKAGE_CACHE_FOLDERS: &[&str] = &["Yarn", "pip", "Homebrew", "pnpm"];
 /// Not searched for build folders or large files.
 const SKIPPED_HOME_FOLDERS: &[&str] = &["Library", ".Trash", ".cargo", ".rustup", ".npm", ".git"];
 
+struct LeftoverDir {
+    parent: &'static str,
+    note: &'static str,
+    container: bool,
+    saved_state: bool,
+}
+
+const LEFTOVER_DIRS: &[LeftoverDir] = &[
+    LeftoverDir {
+        parent: "Library/Caches",
+        note: "The app recreates this",
+        container: false,
+        saved_state: false,
+    },
+    LeftoverDir {
+        parent: "Library/Application Support",
+        note: "May contain data the app saved",
+        container: false,
+        saved_state: false,
+    },
+    LeftoverDir {
+        parent: "Library/Containers",
+        note: "May contain data the app saved",
+        container: true,
+        saved_state: false,
+    },
+    LeftoverDir {
+        parent: "Library/Saved Application State",
+        note: "May contain data the app saved",
+        container: false,
+        saved_state: true,
+    },
+    LeftoverDir {
+        parent: "Library/HTTPStorages",
+        note: "May contain data the app saved",
+        container: false,
+        saved_state: false,
+    },
+];
+
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub node: NodeId,
@@ -59,6 +99,8 @@ pub struct Candidate {
     pub path: PathBuf,
     pub size: u64,
     pub note: Option<String>,
+    /// Set for leftovers. Basket add and the Trash move both check it again.
+    pub proof: Option<LeftoverProof>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +129,7 @@ pub fn suggest(
     places: &Places,
     running: &RunningApps,
     now: SystemTime,
+    inventory: &Inventory,
 ) -> Vec<Suggestion> {
     let mut rules = Rules {
         tree,
@@ -103,6 +146,7 @@ pub fn suggest(
         rules.archives(),
         rules.package_caches(),
         rules.build_folders(),
+        rules.leftovers(inventory),
         rules.app_caches(),
         rules.logs(),
         rules.large_files(),
@@ -175,6 +219,7 @@ impl Rules<'_> {
             path: self.user_path(id),
             size: self.tree.allocated(id),
             note,
+            proof: None,
         }
     }
 
@@ -431,6 +476,114 @@ impl Rules<'_> {
         None
     }
 
+    fn leftovers(&mut self, inventory: &Inventory) -> Suggestion {
+        const NOT_FOUND: &str = "Not found under Applications on this Mac";
+        if !inventory.is_complete() || self.running.has_unreadable_process() {
+            let reason = if self.running.has_unreadable_process() && inventory.is_complete() {
+                "A running process could not be identified".to_string()
+            } else {
+                inventory
+                    .reason()
+                    .unwrap_or("The app list could not be read")
+                    .to_string()
+            };
+            let mut skipped = vec![reason];
+            if let Some(note) = inventory.checked_note() {
+                skipped.push(note);
+            }
+            return self.finish(Category::Leftovers, Vec::new(), skipped);
+        }
+
+        let mut items = Vec::new();
+        for place in LEFTOVER_DIRS {
+            let Some(root) = self.node(place.parent) else {
+                continue;
+            };
+            for child in self.tree.children(root) {
+                let Some(bundle_id) = bundle_id_of(self.tree.name(child), place.saved_state) else {
+                    continue;
+                };
+                if crate::inventory::is_apple(&bundle_id)
+                    || inventory.contains(&bundle_id)
+                    || self.running.has_bundle(&bundle_id)
+                    || (place.parent.ends_with("Application Support")
+                        && self.tree.name(child).eq_ignore_ascii_case("MobileSync"))
+                    || !self.leftover_ok(child, place.container)
+                {
+                    continue;
+                }
+                let path = self.user_path(child);
+                let Some(proof) = LeftoverProof::issue(
+                    &path,
+                    &bundle_id,
+                    place.container,
+                    inventory,
+                    self.places,
+                ) else {
+                    continue;
+                };
+                let mut item = self.candidate(
+                    child,
+                    Some(format!("{bundle_id} · {} · {NOT_FOUND}", place.note)),
+                );
+                item.proof = Some(proof);
+                items.push(item);
+            }
+        }
+        if items.is_empty() {
+            return Suggestion {
+                category: Category::Leftovers,
+                items,
+                skipped: Vec::new(),
+            };
+        }
+        let mut skipped = Vec::new();
+        if let Some(note) = inventory.checked_note() {
+            skipped.push(note);
+        }
+        self.finish(Category::Leftovers, items, skipped)
+    }
+
+    fn leftover_ok(&self, id: NodeId, container: bool) -> bool {
+        let flags = self.tree.flags(id);
+        if flags.contains(NodeFlags::REMOVED)
+            || flags.contains(NodeFlags::DATALESS)
+            || flags.contains(NodeFlags::MOUNT_POINT)
+            || flags.contains(NodeFlags::UNREADABLE)
+            || self.tree.allocated(id) < MIN_APP_CACHE
+            || self.tree.kind(id) != NodeKind::Directory
+        {
+            return false;
+        }
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if self.taken.contains(&node) {
+                return false;
+            }
+            current = self.tree.parent(node);
+        }
+        if self.hides_taken_child(id) {
+            return false;
+        }
+        let path = self.user_path(id);
+        if managed::removal_includes_managed(&path, self.places) {
+            return false;
+        }
+        match safety::check_path(&path, self.places) {
+            Err(safety::Refusal::ManagedByApp) => container,
+            Ok(()) => !container,
+            Err(_) => false,
+        }
+    }
+
+    fn hides_taken_child(&self, id: NodeId) -> bool {
+        let prefix = self.tree.path(id);
+        self.taken.iter().any(|&taken| {
+            let path = self.tree.path(taken);
+            path.starts_with(&prefix) && path != prefix
+        })
+    }
+
     fn app_caches(&mut self) -> Suggestion {
         let mut items = Vec::new();
         let mut running = 0;
@@ -499,6 +652,19 @@ impl Rules<'_> {
         }
         self.finish(Category::LargeFiles, items, Vec::new())
     }
+}
+
+fn bundle_id_of(name: &OsStr, saved_state: bool) -> Option<String> {
+    let name = name.to_str()?;
+    let bundle_id = if saved_state {
+        name.len()
+            .checked_sub(".savedState".len())
+            .and_then(|end| name.get(..end))
+            .filter(|_| name.to_ascii_lowercase().ends_with(".savedstate"))?
+    } else {
+        name
+    };
+    crate::inventory::is_bundle_id(bundle_id).then(|| bundle_id.to_string())
 }
 
 fn has_extension(name: &OsStr, extensions: &[&str]) -> bool {

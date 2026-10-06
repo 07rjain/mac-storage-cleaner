@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use cleanup::{
-    Action, Basket, Category, LogEntry, ManagedPlace, Opener, OperationLog, Outcome, Places,
-    RunningApps, Safety, Suggestion,
+    Action, Basket, Category, Inventory, LeftoverProof, LogEntry, ManagedPlace, Opener,
+    OperationLog, Outcome, Places, RunningApps, Safety, Suggestion,
 };
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseDownEvent, Pixels, Point, Render, Role,
@@ -91,6 +91,7 @@ pub(super) struct Cleanup {
     history: Vec<LogEntry>,
     _measure: Option<Task<()>>,
     _suggest: Option<Task<()>>,
+    _add: Option<Task<()>>,
     _work: Option<Task<()>>,
     _notice: Option<Task<()>>,
 }
@@ -114,6 +115,7 @@ impl Cleanup {
             history: Vec::new(),
             _measure: None,
             _suggest: None,
+            _add: None,
             _work: None,
             _notice: None,
         }
@@ -133,6 +135,7 @@ impl Cleanup {
         }
         self._measure = None;
         self._suggest = None;
+        self._add = None;
     }
 
     fn basket_len(&self) -> usize {
@@ -210,7 +213,7 @@ impl StorageView {
     pub(super) fn add_item(&mut self, item: Item, cx: &mut Context<Self>) {
         match self.item_target(item) {
             Some((path, size, node)) => {
-                self.add_to_basket(vec![(path, Some(node), size)], Category::Chosen, cx);
+                self.add_to_basket(vec![(path, Some(node), size, None)], Category::Chosen, cx);
             }
             None => self.show_notice("Only files and folders can go in the basket", cx),
         }
@@ -229,25 +232,108 @@ impl StorageView {
     /// Adds items, and says why any were refused. Returns how many were added.
     fn add_to_basket(
         &mut self,
-        items: Vec<(PathBuf, Option<NodeId>, u64)>,
+        items: Vec<(PathBuf, Option<NodeId>, u64, Option<LeftoverProof>)>,
         category: Category,
         cx: &mut Context<Self>,
     ) -> usize {
-        let Some(basket) = &mut self.cleanup.basket else {
+        if items.iter().any(|item| item.3.is_some()) {
+            self.add_checked_leftovers(items, cx);
+            return 0;
+        }
+        let (added, refused) = {
+            let Some(basket) = &mut self.cleanup.basket else {
+                self.show_notice(
+                    "The basket isn't available: the home folder wasn't found",
+                    cx,
+                );
+                return 0;
+            };
+            let mut added = 0;
+            let mut refused = Vec::new();
+            for (path, node, size, _) in items {
+                match basket.add(&path, node, category, size) {
+                    Ok(_) => added += 1,
+                    Err(error) => refused.push((path, error.reason())),
+                }
+            }
+            (added, refused)
+        };
+        self.report_basket_adds(added, refused, cx);
+        added
+    }
+
+    /// Leftover proofs are checked against a fresh Applications inventory, off the main thread.
+    fn add_checked_leftovers(
+        &mut self,
+        items: Vec<(PathBuf, Option<NodeId>, u64, Option<LeftoverProof>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(home) = self
+            .cleanup
+            .places
+            .as_ref()
+            .map(|places| places.home.clone())
+        else {
             self.show_notice(
                 "The basket isn't available: the home folder wasn't found",
                 cx,
             );
-            return 0;
+            return;
         };
-        let mut added = 0;
-        let mut refused = Vec::new();
-        for (path, node, size) in items {
-            match basket.add(&path, node, category, size) {
-                Ok(_) => added += 1,
-                Err(error) => refused.push((path, error.reason())),
+        let generation = self.generation;
+        self.cleanup._add = Some(cx.spawn(async move |this, cx| {
+            let inventory = cx
+                .background_executor()
+                .spawn(async move {
+                    let running = RunningApps::current();
+                    Inventory::for_this_mac(&home, &running)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.generation == generation {
+                    view.finish_leftover_add(items, &inventory, cx);
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn finish_leftover_add(
+        &mut self,
+        items: Vec<(PathBuf, Option<NodeId>, u64, Option<LeftoverProof>)>,
+        inventory: &Inventory,
+        cx: &mut Context<Self>,
+    ) {
+        let (added, refused) = {
+            let Some(basket) = &mut self.cleanup.basket else {
+                return;
+            };
+            let mut added = 0;
+            let mut refused = Vec::new();
+            for (path, node, size, proof) in items {
+                if basket.contains(&path) {
+                    continue;
+                }
+                let result = match proof {
+                    Some(proof) => basket.add_leftover(&path, node, size, &proof, inventory),
+                    None => basket.add(&path, node, Category::Leftovers, size),
+                };
+                match result {
+                    Ok(_) => added += 1,
+                    Err(error) => refused.push((path, error.reason())),
+                }
             }
-        }
+            (added, refused)
+        };
+        self.report_basket_adds(added, refused, cx);
+    }
+
+    fn report_basket_adds(
+        &mut self,
+        added: usize,
+        refused: Vec<(PathBuf, String)>,
+        cx: &mut Context<Self>,
+    ) {
         let notice = match refused.as_slice() {
             [] => None,
             [(path, reason)] => Some(format!(
@@ -271,7 +357,6 @@ impl StorageView {
             self.basket_changed(cx);
         }
         cx.notify();
-        added
     }
 
     pub(super) fn remove_from_basket(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -356,9 +441,10 @@ impl StorageView {
                 .background_executor()
                 .spawn(async move {
                     let running = RunningApps::current();
+                    let inventory = Inventory::for_this_mac(&places.home, &running);
                     let tree = shared.read();
                     (
-                        cleanup::suggest(&tree, &places, &running, SystemTime::now()),
+                        cleanup::suggest(&tree, &places, &running, SystemTime::now(), &inventory),
                         cleanup::managed_places(&tree, &places),
                     )
                 })
@@ -384,7 +470,14 @@ impl StorageView {
                 .items
                 .iter()
                 .filter(|item| !self.cleanup.in_basket(&item.path))
-                .map(|item| (item.path.clone(), Some(item.node), item.size))
+                .map(|item| {
+                    (
+                        item.path.clone(),
+                        Some(item.node),
+                        item.size,
+                        item.proof.clone(),
+                    )
+                })
                 .collect();
             self.add_to_basket(items, suggestion.category, cx);
         }
@@ -400,7 +493,14 @@ impl StorageView {
             .items
             .iter()
             .filter(|item| !self.cleanup.in_basket(&item.path))
-            .map(|item| (item.path.clone(), Some(item.node), item.size))
+            .map(|item| {
+                (
+                    item.path.clone(),
+                    Some(item.node),
+                    item.size,
+                    item.proof.clone(),
+                )
+            })
             .collect();
         self.add_to_basket(items, suggestion.category, cx);
     }
@@ -416,7 +516,12 @@ impl StorageView {
             self.remove_from_basket(&item.path, cx);
         } else {
             self.add_to_basket(
-                vec![(item.path.clone(), Some(item.node), item.size)],
+                vec![(
+                    item.path.clone(),
+                    Some(item.node),
+                    item.size,
+                    item.proof.clone(),
+                )],
                 suggestion.category,
                 cx,
             );
@@ -574,7 +679,9 @@ impl StorageView {
                         .ok()
                         .map(|volume| volume.available);
                     let running = RunningApps::current();
-                    let outcome = cleanup::move_to_trash(&items, &places, &scan_root, &running);
+                    let inventory = Inventory::for_this_mac(&places.home, &running);
+                    let outcome =
+                        cleanup::move_to_trash(&items, &places, &scan_root, &running, &inventory);
                     let trash_size = trash_size(&outcome);
                     (outcome, before, trash_size)
                 })

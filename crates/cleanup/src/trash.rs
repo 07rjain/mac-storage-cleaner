@@ -9,7 +9,7 @@ use scanner::NodeId;
 
 use crate::basket::{BasketItem, Identity};
 use crate::safety::{self, Refusal};
-use crate::{Category, Places, RunningApps};
+use crate::{Category, Inventory, LeftoverProof, Places, RunningApps};
 
 #[derive(Debug, Clone)]
 pub struct Moved {
@@ -49,6 +49,7 @@ pub fn move_to_trash(
     places: &Places,
     scan_root: &Path,
     running: &RunningApps,
+    inventory: &Inventory,
 ) -> Outcome {
     let mut outcome = Outcome::default();
     for item in items {
@@ -58,8 +59,25 @@ pub fn move_to_trash(
             category: item.category,
             reason,
         };
+        if let Some(proof) = &item.proof
+            && let Err(reason) = proof.check(&item.path, inventory, places)
+        {
+            outcome.failed.push(fail(reason.into()));
+            continue;
+        }
         let metadata = match safety::check(&item.path, places, scan_root) {
             Ok(metadata) => metadata,
+            Err(Refusal::ManagedByApp)
+                if item.proof.as_ref().is_some_and(LeftoverProof::is_container) =>
+            {
+                match safety::read_leftover_container(&item.path, scan_root) {
+                    Ok(metadata) => metadata,
+                    Err(refusal) => {
+                        outcome.failed.push(fail(refusal.reason().into()));
+                        continue;
+                    }
+                }
+            }
             Err(refusal) => {
                 outcome.failed.push(fail(refusal.reason().into()));
                 continue;

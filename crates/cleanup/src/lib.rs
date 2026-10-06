@@ -3,6 +3,7 @@
 //! path goes through [`safety`] first.
 
 mod basket;
+mod inventory;
 mod log;
 mod managed;
 mod processes;
@@ -15,6 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use basket::{AddError, Basket, BasketItem};
+pub use inventory::{Inventory, LeftoverProof, STALE_REASON};
 pub use log::{Action, LogEntry, OperationLog};
 pub use managed::{ManagedKind, ManagedPlace, Opener, managed_places};
 pub use processes::RunningApps;
@@ -33,6 +35,8 @@ pub enum Category {
     AppCaches,
     Logs,
     LargeFiles,
+    /// Support files for a bundle ID that was not found under Applications.
+    Leftovers,
     /// Added by the user from the chart or the list.
     Chosen,
 }
@@ -55,6 +59,7 @@ impl Category {
             Self::AppCaches => "App caches",
             Self::Logs => "Logs",
             Self::LargeFiles => "Large files",
+            Self::Leftovers => "Leftover files not tied to an installed app",
             Self::Chosen => "Chosen by you",
         }
     }
@@ -81,6 +86,9 @@ impl Category {
             Self::AppCaches => "Data apps rebuild; an app may start slower once",
             Self::Logs => "Old app and system logs",
             Self::LargeFiles => "Files of 1 GB or more; check each one",
+            Self::Leftovers => {
+                "Bundle IDs not found under Applications on this Mac. A cache is recreated; other folders may contain saved data"
+            }
             Self::Chosen => "Items you added",
         }
     }

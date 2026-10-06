@@ -11,6 +11,8 @@ use objc2_foundation::{NSBundle, NSString};
 pub struct RunningApps {
     /// Lowercased bundle IDs of running apps.
     bundle_ids: HashSet<String>,
+    /// A live process whose path could not be read. That is not proof that nothing is running.
+    unknown_processes: bool,
     /// Lowercased app names, from `Name.app`.
     app_names: HashSet<String>,
     /// Lowercased executable and script names without extension, from the process path and
@@ -23,8 +25,10 @@ impl RunningApps {
         let mut running = Self::default();
         let mut bundles: HashMap<PathBuf, Option<String>> = HashMap::new();
         for pid in all_pids() {
-            if let Some(path) = process_path(pid) {
-                running.add_path(&path, &mut bundles);
+            match process_path(pid) {
+                Ok(path) => running.add_path(&path, &mut bundles),
+                Err(ProcessPathError::Gone) => {}
+                Err(ProcessPathError::Unreadable) => running.unknown_processes = true,
             }
             for argument in arguments(pid).into_iter().take(2) {
                 if let Some(name) = command_name(Path::new(&argument)) {
@@ -46,9 +50,29 @@ impl RunningApps {
         };
         Self {
             bundle_ids: lower(&mut bundle_ids.into_iter()),
+            unknown_processes: false,
             app_names: lower(&mut app_names.into_iter()),
             commands: lower(&mut commands.into_iter()),
         }
+    }
+
+    /// Marks the snapshot as missing at least one process path. Leftovers stay hidden, because
+    /// an unreadable path is not proof that its app is absent.
+    pub fn with_unreadable_process(mut self) -> Self {
+        self.unknown_processes = true;
+        self
+    }
+
+    pub fn has_unreadable_process(&self) -> bool {
+        self.unknown_processes
+    }
+
+    pub fn bundle_ids(&self) -> impl Iterator<Item = &str> {
+        self.bundle_ids.iter().map(String::as_str)
+    }
+
+    pub fn has_bundle(&self, id: &str) -> bool {
+        self.bundle_ids.contains(&id.to_lowercase())
     }
 
     fn add_path(&mut self, path: &Path, bundles: &mut HashMap<PathBuf, Option<String>>) {
@@ -126,16 +150,28 @@ fn all_pids() -> Vec<c_int> {
     pids
 }
 
-fn process_path(pid: c_int) -> Option<PathBuf> {
+enum ProcessPathError {
+    /// The process exited between the list and the read.
+    Gone,
+    /// The path could not be read. This is not evidence that the process is not an app.
+    Unreadable,
+}
+
+fn process_path(pid: c_int) -> Result<PathBuf, ProcessPathError> {
     let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: `buffer` has room for the size passed.
     let length =
         unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if length <= 0 {
-        return None;
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Err(ProcessPathError::Gone)
+        } else {
+            Err(ProcessPathError::Unreadable)
+        };
     }
     buffer.truncate(length as usize);
-    Some(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
+    Ok(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
 }
 
 /// The process's arguments (`KERN_PROCARGS2`). Only the user's own processes are readable.
@@ -195,7 +231,7 @@ fn arguments(pid: c_int) -> Vec<String> {
     arguments
 }
 
-fn bundle_identifier(app: &Path) -> Option<String> {
+pub(crate) fn bundle_identifier(app: &Path) -> Option<String> {
     autoreleasepool(|_| {
         let bundle = NSBundle::bundleWithPath(&NSString::from_str(app.to_str()?))?;
         Some(bundle.bundleIdentifier()?.to_string())

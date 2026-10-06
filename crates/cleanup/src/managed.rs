@@ -1,7 +1,7 @@
 //! Large data that apps manage themselves. Its size is shown with a way to the app, but it is
 //! never added to the basket.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use scanner::{NodeFlags, NodeId, NodeKind, Tree};
 
@@ -109,6 +109,25 @@ const PLACES: &[(ManagedKind, &str)] = &[
         "Library/Containers/com.utmapp.UTM/Data/Documents",
     ),
 ];
+
+const MANAGED_RELATIVES: &[&str] = &[
+    "Library/Application Support/MobileSync/Backup",
+    "Library/Containers/com.apple.mail/Data/Library/Mail Downloads",
+    "Library/Messages/Attachments",
+    "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+    "Parallels",
+    "Virtual Machines.localized",
+    "Library/Containers/com.utmapp.UTM/Data/Documents",
+];
+
+/// Whether moving `path` would remove a managed place, or remove something inside one.
+/// `path` is a user path.
+pub fn removal_includes_managed(path: &Path, places: &Places) -> bool {
+    MANAGED_RELATIVES.iter().any(|relative| {
+        let managed = places.in_home(relative);
+        path == managed || path.starts_with(&managed) || managed.starts_with(path)
+    })
+}
 
 /// Managed places found in the scan, largest first. Empty ones are left out.
 pub fn managed_places(tree: &Tree, places: &Places) -> Vec<ManagedPlace> {

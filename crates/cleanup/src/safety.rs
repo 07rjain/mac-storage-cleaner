@@ -138,6 +138,26 @@ pub fn check(path: &Path, places: &Places, scan_root: &Path) -> Result<Metadata,
     Ok(metadata)
 }
 
+/// Metadata for a container folder the leftover proof already accepted. [`check_path`] still
+/// refuses that folder; this only reads what is on disk.
+pub(crate) fn read_leftover_container(path: &Path, scan_root: &Path) -> Result<Metadata, Refusal> {
+    if !path.starts_with(scan_root) {
+        return Err(Refusal::OutsideHome);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Refusal::Missing),
+        Err(_) => return Err(Refusal::Missing),
+    };
+    if metadata.st_flags() & SF_DATALESS != 0 {
+        return Err(Refusal::Dataless);
+    }
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Refusal::Changed);
+    }
+    Ok(metadata)
+}
+
 fn check_home(rest: &Path) -> Result<(), Refusal> {
     let names: Vec<&OsStr> = rest.components().map(Component::as_os_str).collect();
     let Some(&first) = names.first() else {

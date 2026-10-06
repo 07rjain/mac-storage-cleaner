@@ -314,7 +314,35 @@ fn replace_swaps_in_a_rescanned_folder_and_matches_a_full_scan() {
     let whole = scan(root.path());
     assert!(tree.replace(tree.root(), &whole));
     assert_eq!(tree.allocated(tree.root()), whole.allocated(whole.root()));
+    assert_eq!(
+        tree.len(),
+        whole.len(),
+        "replacing the root drops the old copy"
+    );
     assert!(tree.find(&root.path().join("extra.bin")).is_some());
+}
+
+#[test]
+fn repeated_folder_replace_drops_old_copies() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("a")).unwrap();
+    write_bytes(&root.path().join("a/b.bin"), 5_000);
+    write_bytes(&root.path().join("c.bin"), 5_000);
+    let mut tree = scan(root.path());
+    for n in 0..8 {
+        write_bytes(&root.path().join(format!("a/{n}.bin")), 5_000);
+        let id = tree.find(&root.path().join("a")).unwrap();
+        let rescan = scan(&root.path().join("a"));
+        assert!(tree.replace(id, &rescan));
+    }
+    let fresh = scan(root.path());
+    assert_eq!(tree.allocated(tree.root()), fresh.allocated(fresh.root()));
+    assert!(
+        tree.len() < fresh.len() * 3,
+        "old copies must be reclaimed, len {} vs fresh {}",
+        tree.len(),
+        fresh.len()
+    );
 }
 
 /// `cargo test -p scanner --release --test scan -- --ignored --nocapture measure_time`

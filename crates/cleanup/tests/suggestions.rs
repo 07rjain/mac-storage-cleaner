@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use cleanup::{Category, Places, RunningApps, Suggestion};
+use cleanup::{Category, Inventory, Places, RunningApps, Suggestion};
 use scanner::ScanOptions;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -66,12 +66,12 @@ fn sample_home() -> tempfile::TempDir {
     home
 }
 
-fn suggestions(home: &Path, running: &RunningApps) -> Vec<Suggestion> {
+fn suggestions(home: &Path, running: &RunningApps, inventory: &Inventory) -> Vec<Suggestion> {
     let tree = scanner::scan(ScanOptions::new(home)).unwrap();
     let places = Places {
         home: home.to_path_buf(),
     };
-    cleanup::suggest(&tree, &places, running, SystemTime::now())
+    cleanup::suggest(&tree, &places, running, SystemTime::now(), inventory)
 }
 
 fn names(suggestions: &[Suggestion], category: Category) -> Vec<String> {
@@ -103,7 +103,11 @@ fn suggests_only_what_the_rules_recognize() {
         Vec::new(),
     );
 
-    let found = suggestions(home.path(), &running);
+    let found = suggestions(
+        home.path(),
+        &running,
+        &Inventory::known(["com.example.editor", "com.example.player"]),
+    );
 
     assert_eq!(names(&found, Category::OldInstallers), ["Xcode_15.xip"]);
     assert_eq!(names(&found, Category::XcodeDerivedData), ["App-abc"]);
@@ -144,7 +148,11 @@ fn leaves_tools_alone_while_they_run() {
     let home = sample_home();
     let running = RunningApps::from_parts(Vec::new(), ["Xcode".to_string()], ["npm".to_string()]);
 
-    let found = suggestions(home.path(), &running);
+    let found = suggestions(
+        home.path(),
+        &running,
+        &Inventory::known(Vec::<String>::new()),
+    );
 
     assert!(names(&found, Category::XcodeDerivedData).is_empty());
     assert!(names(&found, Category::PackageCaches).is_empty());
@@ -162,7 +170,11 @@ fn suggested_items_never_overlap_and_all_pass_the_safety_rules() {
         home: home.path().to_path_buf(),
     };
 
-    let found = suggestions(home.path(), &RunningApps::default());
+    let found = suggestions(
+        home.path(),
+        &RunningApps::default(),
+        &Inventory::known(Vec::<String>::new()),
+    );
 
     let paths: Vec<_> = found
         .iter()

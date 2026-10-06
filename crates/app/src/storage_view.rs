@@ -1,6 +1,7 @@
 mod basket_ui;
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -21,18 +22,26 @@ use crate::access;
 use crate::compare;
 use crate::file_types::FileType;
 use crate::format;
+use crate::icicle;
 use crate::model::{self, Accounting, Item, Row};
 use crate::settings::{Chart, Settings};
 use crate::sunburst::{self, Geometry, Hit, Segment};
 use crate::theme::{self, Theme};
 use crate::treemap::{self, Kind as TileKind};
+use crate::types::{self, Bucket};
 use crate::widgets::button;
-use crate::{ShowSunburst, ShowTreemap};
+use crate::{ShowIcicle, ShowSunburst, ShowTree, ShowTreemap, ShowTypes};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(1_200);
 const ROW_HEIGHT: f32 = 28.0;
 const DROPDOWN_LIMIT: usize = 60;
+const TREE_MAX_LINES: usize = 4_000;
+const TREE_MAX_DEPTH: u8 = 12;
+/// Direct children drawn under one expanded folder. The rest become one "Smaller items" row.
+const TREE_CHILDREN: usize = 400;
+/// Folders with more entries than this open instead of expanding, so the outline stays quick.
+const TREE_EXPAND_LIMIT: u32 = 8_000;
 
 actions!(
     storage,
@@ -40,6 +49,8 @@ actions!(
         SelectNext,
         SelectPrevious,
         OpenSelected,
+        ExpandOrOpen,
+        CollapseOrUp,
         GoUp,
         GoToTop,
         Dismiss,
@@ -159,6 +170,26 @@ struct Snapshot {
     tile_labels: Vec<TileLabel>,
 }
 
+/// One row of the outline. Paths, not node ids, remember which folders are expanded.
+#[derive(Clone, Copy)]
+struct TreeLine {
+    item: Item,
+    depth: u8,
+    expandable: bool,
+    expanded: bool,
+    size: u64,
+    settled: bool,
+    /// Index among the open folder's children, which picks the color.
+    branch: usize,
+}
+
+/// Text drawn on an icicle bar. `segment` is `None` for the focused folder.
+struct BandLabel {
+    segment: Option<usize>,
+    name: SharedString,
+    size: String,
+}
+
 /// Text drawn on a treemap rectangle.
 struct TileLabel {
     /// Into `StorageView::tiles`.
@@ -167,6 +198,25 @@ struct TileLabel {
     size: Option<String>,
     /// Folders show their name in the strip above their contents.
     header: bool,
+}
+
+/// The open folder and selection, as paths, so they survive a tree replace.
+struct Anchor {
+    folder: PathBuf,
+    selected: Option<PathBuf>,
+    hovered: Option<PathBuf>,
+}
+
+/// Changes inside the app's own support folder (the scan snapshot, settings) are not disk changes
+/// the chart should rescan.
+fn skip_app_data(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(data) = crate::settings::data_dir() else {
+        return paths;
+    };
+    paths
+        .into_iter()
+        .filter(|path| !path.starts_with(&data))
+        .collect()
 }
 
 /// What is under the pointer in either chart.
@@ -198,6 +248,16 @@ pub struct StorageView {
     tiles: Rc<treemap::Layout>,
     /// Where the treemap was last drawn; the next layout uses its size.
     treemap_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Where the icicle was last drawn, for hit testing.
+    icicle_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    band_labels: Vec<BandLabel>,
+    tree_lines: Rc<Vec<TreeLine>>,
+    /// Expanded folders, as paths, so a rescan does not collapse them.
+    expanded: HashSet<PathBuf>,
+    tree_scroll: UniformListScrollHandle,
+    type_shares: Rc<Vec<types::Share>>,
+    /// Scan generation, folder, tree length, and whether child folders were opened.
+    type_key: Option<(u64, NodeId, usize, bool)>,
     list_scroll: UniformListScrollHandle,
     cleanup: Cleanup,
     folder_rescan: Option<FolderRescan>,
@@ -235,6 +295,13 @@ impl StorageView {
             geometry: Rc::default(),
             tiles: Rc::default(),
             treemap_bounds: Rc::default(),
+            icicle_bounds: Rc::default(),
+            band_labels: Vec::new(),
+            tree_lines: Rc::default(),
+            expanded: HashSet::new(),
+            tree_scroll: UniformListScrollHandle::new(),
+            type_shares: Rc::default(),
+            type_key: None,
             list_scroll: UniformListScrollHandle::new(),
             cleanup: Cleanup::new(),
             folder_rescan: None,
@@ -423,8 +490,12 @@ impl StorageView {
                     .folder_rescan
                     .take()
                     .map_or_else(SharedString::default, |rescan| rescan.name);
+                let anchor = view.anchor();
                 match rescan {
                     Ok(rescan) if shared.replace(id, &rescan) => {
+                        if let Some(anchor) = anchor {
+                            view.restore_anchor(anchor);
+                        }
                         view.tree_changed(cx);
                         view.show_notice(format!("Rescanned {name}"), cx);
                         view.apply_pending_watch(cx);
@@ -544,15 +615,19 @@ impl StorageView {
         let Some(scan) = &self.scan else {
             return;
         };
+        let paths = skip_app_data(paths);
+        let batch = EventBatch {
+            paths: paths.clone(),
+            flags,
+        };
+        if batch.paths.is_empty() && !batch.needs_full_scan() {
+            return;
+        }
         if !self.can_rescan_folder() {
             self.pending_changes.extend(paths);
             self.pending_flags |= flags;
             return;
         }
-        let batch = EventBatch {
-            paths: paths.clone(),
-            flags,
-        };
         let shared = scan.handle.shared_tree();
         let tree = scan.handle.tree();
         let targets = if batch.needs_full_scan() {
@@ -584,6 +659,7 @@ impl StorageView {
                     return;
                 }
                 view.folder_rescan.take();
+                let anchor = view.anchor();
                 let mut any = false;
                 for (id, rescan) in results {
                     if let Ok(rescan) = rescan {
@@ -591,6 +667,9 @@ impl StorageView {
                     }
                 }
                 if any {
+                    if let Some(anchor) = anchor {
+                        view.restore_anchor(anchor);
+                    }
                     view.tree_changed(cx);
                 }
                 view.apply_pending_watch(cx);
@@ -772,9 +851,16 @@ impl StorageView {
 
         let rows = model::rows(&tree, self.folder, accounting, complete);
         match self.chart {
-            Chart::Sunburst => {
+            Chart::Sunburst | Chart::Icicle => {
                 self.segments = Rc::new(sunburst::layout(&tree, self.folder, &rows));
                 self.tiles = Rc::default();
+                self.tree_lines = Rc::default();
+                let labels = if self.chart == Chart::Icicle {
+                    self.make_band_labels(&tree, complete)
+                } else {
+                    Vec::new()
+                };
+                self.band_labels = labels;
             }
             Chart::Treemap => {
                 let size = self
@@ -789,6 +875,27 @@ impl StorageView {
                     f32::from(size.height),
                 ));
                 self.segments = Rc::default();
+                self.tree_lines = Rc::default();
+                self.band_labels.clear();
+            }
+            Chart::Tree => {
+                let lines = self.tree_lines_of(&tree, &rows);
+                self.tree_lines = Rc::new(lines);
+                self.segments = Rc::default();
+                self.tiles = Rc::default();
+                self.band_labels.clear();
+            }
+            Chart::Types => {
+                let deep = complete;
+                let key = (self.generation, self.folder, tree.len(), deep);
+                if self.type_key != Some(key) {
+                    self.type_shares = Rc::new(types::breakdown(&tree, self.folder, deep));
+                    self.type_key = Some(key);
+                }
+                self.segments = Rc::default();
+                self.tiles = Rc::default();
+                self.tree_lines = Rc::default();
+                self.band_labels.clear();
             }
         }
         let tile_labels = self.tile_labels(&tree, complete);
@@ -801,6 +908,15 @@ impl StorageView {
             self.scroll_to_selection = false;
             if let Some(index) = rows.iter().position(|row| Some(row.item) == self.selected) {
                 self.list_scroll
+                    .scroll_to_item(index, ScrollStrategy::Nearest);
+            }
+            if self.chart == Chart::Tree
+                && let Some(index) = self
+                    .tree_lines
+                    .iter()
+                    .position(|line| Some(line.item) == self.selected)
+            {
+                self.tree_scroll
                     .scroll_to_item(index, ScrollStrategy::Nearest);
             }
         }
@@ -839,6 +955,86 @@ impl StorageView {
     }
 
     /// Names for treemap rectangles large enough to hold one, biggest levels first.
+    fn make_band_labels(&self, tree: &Tree, complete: bool) -> Vec<BandLabel> {
+        let mut labels = vec![BandLabel {
+            segment: None,
+            name: self.name(tree, self.folder),
+            size: format::size(tree.allocated(self.folder), tree.is_settled(self.folder)),
+        }];
+        let wide = |start: f64, end: f64| end - start >= 0.07;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if !wide(segment.start, segment.end) {
+                continue;
+            }
+            labels.push(BandLabel {
+                segment: Some(index),
+                name: self.info(tree, segment.item, complete).name,
+                size: format::size(segment.size, segment.settled),
+            });
+            if labels.len() >= 40 {
+                break;
+            }
+        }
+        labels
+    }
+
+    fn tree_lines_of(&self, tree: &Tree, rows: &[Row]) -> Vec<TreeLine> {
+        let mut lines = Vec::new();
+        self.append_tree_lines(tree, rows, 0, None, &mut lines);
+        lines
+    }
+
+    fn append_tree_lines(
+        &self,
+        tree: &Tree,
+        rows: &[Row],
+        depth: u8,
+        branch: Option<usize>,
+        lines: &mut Vec<TreeLine>,
+    ) {
+        for (index, row) in rows.iter().enumerate() {
+            if lines.len() >= TREE_MAX_LINES {
+                return;
+            }
+            let branch = branch.unwrap_or(index);
+            let (expandable, expanded) = match row.item {
+                Item::Node(id) if model::is_folder(tree, row.item) => {
+                    let has_child = tree.children(id).next().is_some();
+                    let expandable = has_child && tree.items(id) <= TREE_EXPAND_LIMIT;
+                    let expanded = expandable && self.expanded.contains(&tree.path(id));
+                    (expandable, expanded)
+                }
+                _ => (false, false),
+            };
+            lines.push(TreeLine {
+                item: row.item,
+                depth,
+                expandable,
+                expanded,
+                size: row.size,
+                settled: row.settled,
+                branch,
+            });
+            if expanded
+                && depth < TREE_MAX_DEPTH
+                && let Item::Node(id) = row.item
+            {
+                let mut children = model::rows(tree, id, None, tree.is_complete());
+                if children.len() > TREE_CHILDREN {
+                    let rest = children[TREE_CHILDREN..].iter().map(|row| row.size).sum();
+                    let settled = tree.is_settled(id);
+                    children.truncate(TREE_CHILDREN);
+                    children.push(Row {
+                        item: Item::Smaller(id),
+                        size: rest,
+                        settled,
+                    });
+                }
+                self.append_tree_lines(tree, &children, depth + 1, Some(branch), lines);
+            }
+        }
+    }
+
     fn tile_labels(&self, tree: &Tree, complete: bool) -> Vec<TileLabel> {
         const MAX_LABELS: usize = 300;
         self.tiles
@@ -871,12 +1067,51 @@ impl StorageView {
         self.scan.as_ref().map(|scan| read(&scan.handle.tree()))
     }
 
+    /// Paths of the open folder and the selection, captured before a replace changes node ids.
+    fn anchor(&self) -> Option<Anchor> {
+        self.with_tree(|tree| {
+            let path_of = |item: Option<Item>| match item {
+                Some(Item::Node(id)) => Some(tree.path(id)),
+                _ => None,
+            };
+            Anchor {
+                folder: tree.path(self.folder),
+                selected: path_of(self.selected),
+                hovered: path_of(self.hovered),
+            }
+        })
+    }
+
+    fn restore_anchor(&mut self, anchor: Anchor) {
+        let restored = self.with_tree(|tree| {
+            (
+                tree.find(&anchor.folder).unwrap_or(tree.root()),
+                anchor
+                    .selected
+                    .as_deref()
+                    .and_then(|path| tree.find(path))
+                    .map(Item::Node),
+                anchor
+                    .hovered
+                    .as_deref()
+                    .and_then(|path| tree.find(path))
+                    .map(Item::Node),
+            )
+        });
+        if let Some((folder, selected, hovered)) = restored {
+            self.folder = folder;
+            self.selected = selected;
+            self.hovered = hovered;
+        }
+    }
+
     fn open_folder(&mut self, id: NodeId, cx: &mut Context<Self>) {
         self.folder = id;
         self.selected = None;
         self.hovered = None;
         self.dropdown = None;
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -944,19 +1179,27 @@ impl StorageView {
     }
 
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        if self.rows.is_empty() || self.cleanup.is_open() {
+        if self.cleanup.is_open() {
+            return;
+        }
+        let items: Vec<Item> = if self.chart == Chart::Tree && !self.tree_lines.is_empty() {
+            self.tree_lines.iter().map(|line| line.item).collect()
+        } else {
+            self.rows.iter().map(|row| row.item).collect()
+        };
+        if items.is_empty() {
             return;
         }
         let current = self
             .selected
-            .and_then(|item| self.rows.iter().position(|row| row.item == item));
-        let last = self.rows.len() - 1;
+            .and_then(|item| items.iter().position(|candidate| *candidate == item));
+        let last = items.len() - 1;
         let next = match current {
             None if step > 0 => 0,
             None => last,
             Some(index) => index.saturating_add_signed(step).min(last),
         };
-        self.select(Some(self.rows[next].item), cx);
+        self.select(Some(items[next]), cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -976,6 +1219,48 @@ impl StorageView {
         {
             self.open_folder(id, cx);
         }
+    }
+
+    /// Right arrow expands a closed folder in the tree, and otherwise opens the selection.
+    fn expand_or_open(&mut self, _: &ExpandOrOpen, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chart == Chart::Tree
+            && let Some(Item::Node(id)) = self.selected
+            && self
+                .tree_lines
+                .iter()
+                .any(|line| line.item == Item::Node(id) && line.expandable && !line.expanded)
+        {
+            self.set_expanded(id, true, cx);
+            return;
+        }
+        self.open_selected(&OpenSelected, window, cx);
+    }
+
+    /// Left arrow collapses an open folder in the tree, and otherwise goes up.
+    fn collapse_or_up(&mut self, _: &CollapseOrUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chart == Chart::Tree
+            && let Some(Item::Node(id)) = self.selected
+            && self
+                .tree_lines
+                .iter()
+                .any(|line| line.item == Item::Node(id) && line.expanded)
+        {
+            self.set_expanded(id, false, cx);
+            return;
+        }
+        self.go_up(&GoUp, window, cx);
+    }
+
+    fn set_expanded(&mut self, id: NodeId, open: bool, cx: &mut Context<Self>) {
+        let Some(path) = self.with_tree(|tree| tree.path(id)) else {
+            return;
+        };
+        if open {
+            self.expanded.insert(path);
+        } else {
+            self.expanded.remove(&path);
+        }
+        cx.notify();
     }
 
     fn reveal_in_finder(&mut self, _: &RevealInFinder, _: &mut Window, cx: &mut Context<Self>) {
@@ -1048,6 +1333,19 @@ impl StorageView {
                     folder: tile.kind == TileKind::Folder,
                 })
             }
+            Chart::Icicle => {
+                match icicle::hit_test(&self.segments, self.icicle_bounds.get()?, position)? {
+                    icicle::Hit::Root => Some(ChartHit::Center),
+                    icicle::Hit::Segment(index) => {
+                        let segment = self.segments[index];
+                        Some(ChartHit::Item {
+                            item: segment.item,
+                            folder: segment.folder,
+                        })
+                    }
+                }
+            }
+            Chart::Tree | Chart::Types => None,
         }
     }
 
@@ -1399,6 +1697,18 @@ impl StorageView {
                 choice("show-treemap", "Treemap", Chart::Treemap)
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowTreemap), cx)),
             )
+            .child(
+                choice("show-icicle", "Icicle", Chart::Icicle)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowIcicle), cx)),
+            )
+            .child(
+                choice("show-tree", "Tree", Chart::Tree)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowTree), cx)),
+            )
+            .child(
+                choice("show-types", "Types", Chart::Types)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowTypes), cx)),
+            )
     }
 
     fn render_dropdown(
@@ -1472,8 +1782,17 @@ impl StorageView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let chart = match self.chart {
-            Chart::Sunburst => self.render_sunburst(snapshot, theme),
-            Chart::Treemap => self.render_treemap(snapshot, theme),
+            Chart::Sunburst => self
+                .hook_chart(self.render_sunburst(snapshot, theme), cx)
+                .into_any_element(),
+            Chart::Treemap => self
+                .hook_chart(self.render_treemap(snapshot, theme), cx)
+                .into_any_element(),
+            Chart::Icicle => self
+                .hook_chart(self.render_icicle(snapshot, theme), cx)
+                .into_any_element(),
+            Chart::Tree => self.render_tree(snapshot, theme, cx).into_any_element(),
+            Chart::Types => self.render_types(snapshot, theme).into_any_element(),
         };
         div()
             .flex_1()
@@ -1481,29 +1800,363 @@ impl StorageView {
             .h_full()
             .flex()
             .flex_col()
-            .child(
-                chart
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .cursor_pointer()
-                    .on_mouse_move(cx.listener(Self::hover_chart))
-                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        if !*hovered {
-                            this.set_hovered(None, cx);
-                        }
-                    }))
-                    .on_click(cx.listener(Self::click_chart))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.right_click_chart(event, cx)
-                        }),
-                    ),
-            )
+            .child(chart)
             .when(self.chart == Chart::Treemap, |this| {
                 this.child(self.render_legend(theme))
             })
+    }
+
+    fn hook_chart(&self, chart: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        chart
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .cursor_pointer()
+            .on_mouse_move(cx.listener(Self::hover_chart))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.set_hovered(None, cx);
+                }
+            }))
+            .on_click(cx.listener(Self::click_chart))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.right_click_chart(event, cx)
+                }),
+            )
+    }
+
+    fn render_icicle(&self, snapshot: &Snapshot, theme: &Theme) -> Stateful<Div> {
+        let segments = Rc::clone(&self.segments);
+        let colors = segments
+            .iter()
+            .map(|segment| theme.slice(segment, self.hovered == Some(segment.item)))
+            .collect();
+        let outline = self
+            .selected
+            .and_then(|item| segments.iter().position(|segment| segment.item == item))
+            .map(|index| (index, Hsla::from(theme.text)));
+        let style = icicle::Paint {
+            root: Hsla::from(theme.selected),
+            colors,
+            outline,
+        };
+        let rows = f32::from(icicle::row_count(&segments));
+        let inks = style.colors.clone();
+        let labels = self.band_labels.iter().map(|label| {
+            let (start, span, row) = match label.segment {
+                None => (0.0, 1.0, 0.0),
+                Some(index) => {
+                    let segment = segments[index];
+                    (
+                        segment.start as f32,
+                        (segment.end - segment.start) as f32,
+                        f32::from(segment.ring),
+                    )
+                }
+            };
+            let ink = match label.segment {
+                None => Hsla::from(theme.text),
+                Some(index) => theme::ink_on(inks[index]),
+            };
+            div()
+                .absolute()
+                .left(relative(start))
+                .top(relative(row / rows))
+                .w(relative(span))
+                .h(relative(1.0 / rows))
+                .overflow_hidden()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(ink)
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(label.name.clone()),
+                )
+                .child(div().flex_none().child(label.size.clone()))
+        });
+        let bounds_cell = Rc::clone(&self.icicle_bounds);
+        let layout = Rc::clone(&self.segments);
+        div()
+            .id("chart")
+            .role(Role::Image)
+            .aria_label(format!(
+                "Icicle chart of {}, {}. The top bar goes up. Click a bar to open it.",
+                snapshot.folder.name,
+                format::size(snapshot.folder.size, snapshot.folder.settled)
+            ))
+            .relative()
+            .overflow_hidden()
+            .m_2()
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        bounds_cell.set(Some(bounds));
+                        bounds
+                    },
+                    move |_, bounds, window, _| icicle::paint(window, bounds, &layout, &style),
+                )
+                .size_full(),
+            )
+            .children(labels)
+    }
+
+    fn render_tree(
+        &self,
+        snapshot: &Snapshot,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let count = self.tree_lines.len();
+        div()
+            .id("tree")
+            .role(Role::List)
+            .aria_label(format!(
+                "Tree of {}. Use the arrow to expand a folder.",
+                snapshot.folder.name
+            ))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child("Click the arrow to expand. Double-click a folder to open it."),
+            )
+            .child(
+                uniform_list("tree-rows", count, cx.processor(Self::render_tree_rows))
+                    .track_scroll(&self.tree_scroll)
+                    .flex_1(),
+            )
+    }
+
+    fn render_tree_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
+        let theme = Theme::for_appearance(window.appearance());
+        let Some(scan) = &self.scan else {
+            return Vec::new();
+        };
+        let tree = scan.handle.tree();
+        let complete = tree.is_complete();
+        let largest = self.tree_lines.first().map_or(1, |line| line.size.max(1)) as f32;
+        let hover = theme.hover;
+        let total = self.tree_lines.len();
+
+        range
+            .filter_map(|index| {
+                let line = *self.tree_lines.get(index)?;
+                let name = self.info(&tree, line.item, complete).name;
+                let color = theme.slice(
+                    &Segment {
+                        item: line.item,
+                        ring: 1,
+                        start: 0.0,
+                        end: 0.0,
+                        branch: line.branch,
+                        size: line.size,
+                        settled: line.settled,
+                        folder: line.expandable,
+                    },
+                    false,
+                );
+                let selected = self.selected == Some(line.item);
+                let highlighted = self.hovered == Some(line.item);
+                let item = line.item;
+                let id = match item {
+                    Item::Node(id) => Some(id),
+                    _ => None,
+                };
+                Some(
+                    div()
+                        .id(("tree-row", index))
+                        .role(Role::ListItem)
+                        .aria_label(format!("{name}, {}", format::size(line.size, line.settled)))
+                        .aria_selected(selected)
+                        .when(line.expandable, |this| this.aria_expanded(line.expanded))
+                        .aria_level(usize::from(line.depth) + 1)
+                        .aria_position_in_set(index + 1)
+                        .aria_size_of_set(total)
+                        .when(selected, |this| this.aria_active_descendant())
+                        .relative()
+                        .w_full()
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(8.0 + f32::from(line.depth) * 14.0))
+                        .pr_3()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(theme.selected))
+                        .when(!selected && highlighted, |this| this.bg(hover))
+                        .hover(move |style| style.bg(hover))
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .bottom_0()
+                                .h(px(2.))
+                                .w(relative(line.size as f32 / largest))
+                                .bg(color.opacity(0.55)),
+                        )
+                        .child({
+                            let mut chevron = div()
+                                .id(("tree-expand", index))
+                                .w(px(16.))
+                                .flex_none()
+                                .text_color(theme.muted)
+                                .child(match (line.expandable, line.expanded) {
+                                    (true, true) => "▾",
+                                    (true, false) => "▸",
+                                    (false, _) => "",
+                                });
+                            if let Some(id) = id.filter(|_| line.expandable) {
+                                let open = !line.expanded;
+                                chevron = chevron
+                                    .role(Role::Button)
+                                    .aria_label(if line.expanded {
+                                        format!("Collapse {name}")
+                                    } else {
+                                        format!("Expand {name}")
+                                    })
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.set_expanded(id, open, cx);
+                                    }));
+                            }
+                            chevron
+                        })
+                        .child(div().size(px(10.)).flex_none().rounded_sm().bg(color))
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(78.))
+                                .text_right()
+                                .when(!line.settled, |this| this.text_color(theme.muted))
+                                .child(format::size(line.size, line.settled)),
+                        )
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            this.click_row(item, event.click_count(), cx);
+                        }))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.set_hovered(Some(item), cx);
+                            } else if this.hovered == Some(item) {
+                                this.set_hovered(None, cx);
+                            }
+                        })),
+                )
+            })
+            .collect()
+    }
+
+    fn render_types(&self, snapshot: &Snapshot, theme: &Theme) -> impl IntoElement {
+        let largest = self
+            .type_shares
+            .first()
+            .map(|share| share.size)
+            .unwrap_or(1)
+            .max(1) as f32;
+        let grouped = self
+            .type_shares
+            .iter()
+            .any(|share| share.bucket == Bucket::Folders);
+        let mut list = div()
+            .id("types")
+            .role(Role::List)
+            .aria_label(format!("File types in {}", snapshot.folder.name))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child("File types inside this folder."),
+            );
+        if self.type_shares.is_empty() {
+            list = list.child(
+                div()
+                    .text_color(theme.muted)
+                    .child("No files to classify yet."),
+            );
+        }
+        for (index, share) in self.type_shares.iter().enumerate() {
+            let color = match share.bucket {
+                Bucket::Kind(kind) => theme.file_type(kind),
+                Bucket::Folders => Hsla::from(theme.muted),
+            };
+            let title = share.bucket.title();
+            let size = format::size(share.size, snapshot.folder.settled);
+            list = list.child(
+                div()
+                    .id(("type-row", index))
+                    .role(Role::ListItem)
+                    .aria_label(format!("{title}, {size}"))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(10.)).flex_none().rounded_sm().bg(color))
+                            .child(div().flex_1().min_w_0().truncate().child(title))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(78.))
+                                    .text_right()
+                                    .text_color(theme.muted)
+                                    .child(size),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(8.))
+                            .w_full()
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(theme.track)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(share.size as f32 / largest))
+                                    .bg(color),
+                            ),
+                    ),
+            );
+        }
+        list.when(grouped, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child("Folders are kept together. Open one to see the files inside."),
+            )
+        })
     }
 
     fn render_sunburst(&self, snapshot: &Snapshot, theme: &Theme) -> Stateful<Div> {
@@ -2044,6 +2697,8 @@ impl Render for StorageView {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(Self::expand_or_open))
+            .on_action(cx.listener(Self::collapse_or_up))
             .on_action(cx.listener(Self::go_up))
             .on_action(cx.listener(Self::go_to_top))
             .on_action(cx.listener(Self::dismiss))
@@ -2275,6 +2930,123 @@ mod tests {
 
         cx.simulate_keystrokes("alt-cmd-1");
         assert_eq!(view.read_with(cx, |view, _| view.chart), Chart::Sunburst);
+    }
+
+    fn band_center(
+        view: &Entity<StorageView>,
+        cx: &mut VisualTestContext,
+        item: Item,
+    ) -> Point<Pixels> {
+        view.read_with(cx, |view, _| {
+            let bounds = view.icicle_bounds.get().expect("icicle was drawn");
+            let segment = view
+                .segments
+                .iter()
+                .find(|segment| segment.item == item)
+                .unwrap();
+            let rows = f32::from(icicle::row_count(&view.segments));
+            let row_h = bounds.size.height / rows;
+            let fraction = (segment.start + segment.end) as f32 / 2.0;
+            bounds.origin
+                + gpui::point(
+                    bounds.size.width * fraction,
+                    row_h * (f32::from(segment.ring) + 0.5),
+                )
+        })
+    }
+
+    #[gpui::test]
+    fn icicle_opens_a_folder_and_the_top_bar_goes_up(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        cx.update(|cx| crate::init(Settings::default(), cx));
+        let (view, cx) = open(root.path(), cx);
+        let big = child(&view, cx, "big");
+        let Item::Node(big_id) = big else {
+            unreachable!()
+        };
+
+        cx.simulate_keystrokes("alt-cmd-3");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.chart), Chart::Icicle);
+
+        let position = band_center(&view, cx, big);
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(folder(&view, cx), big_id);
+
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let top = view.read_with(cx, |view, _| {
+            let bounds = view.icicle_bounds.get().unwrap();
+            bounds.origin + gpui::point(bounds.size.width * 0.5, bounds.size.height * 0.1)
+        });
+        cx.simulate_click(top, Modifiers::default());
+        assert_eq!(folder(&view, cx), 0);
+    }
+
+    #[gpui::test]
+    fn tree_expands_without_leaving_the_folder(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        cx.update(|cx| crate::init(Settings::default(), cx));
+        let (view, cx) = open(root.path(), cx);
+        let big = child(&view, cx, "big");
+        let Item::Node(big_id) = big else {
+            unreachable!()
+        };
+
+        cx.simulate_keystrokes("alt-cmd-4");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down right");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let nested = view.read_with(cx, |view, _| {
+            view.with_tree(|tree| {
+                tree.children(big_id)
+                    .find(|id| tree.name(*id) == "a.bin")
+                    .map(Item::Node)
+            })
+            .unwrap()
+        });
+        assert_eq!(folder(&view, cx), 0, "expanding stays in the folder");
+        assert!(view.read_with(cx, |view, _| {
+            view.tree_lines.iter().any(|line| Some(line.item) == nested)
+        }));
+
+        cx.simulate_keystrokes("down");
+        assert_eq!(view.read_with(cx, |view, _| view.selected), nested);
+
+        cx.simulate_keystrokes("up right");
+        assert_eq!(folder(&view, cx), big_id);
+    }
+
+    #[gpui::test]
+    fn file_types_group_the_open_folder(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        cx.update(|cx| crate::init(Settings::default(), cx));
+        let (view, cx) = open(root.path(), cx);
+
+        cx.simulate_keystrokes("alt-cmd-5");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        let (documents, other, folders) = view.read_with(cx, |view, _| {
+            let size = |bucket| {
+                view.type_shares
+                    .iter()
+                    .find(|share| share.bucket == bucket)
+                    .map(|share| share.size)
+            };
+            (
+                size(Bucket::Kind(FileType::Document)),
+                size(Bucket::Kind(FileType::Other)),
+                size(Bucket::Folders),
+            )
+        });
+        assert!(documents.is_some_and(|size| size >= 10_000));
+        assert!(other.is_some_and(|size| size >= 2_000_000));
+        assert!(folders.is_some_and(|size| size >= 1_000_000));
     }
 
     #[gpui::test]

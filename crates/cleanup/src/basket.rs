@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use scanner::NodeId;
 
 use crate::safety::{self, Refusal};
-use crate::{Category, Places};
+use crate::{Category, Inventory, LeftoverProof, Places};
 
 /// What an item on disk was when it was added, to notice if it was replaced since.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct BasketItem {
     /// From the scan: what the item takes up, before checking clones and hard links.
     pub size: u64,
     pub(crate) identity: Identity,
+    pub(crate) proof: Option<LeftoverProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +46,8 @@ pub enum AddError {
     Refused(Refusal),
     /// Already in the basket through this enclosing item.
     AlreadyInside(PathBuf),
+    /// The leftover proof no longer matches the app list or the folder.
+    Stale,
 }
 
 impl AddError {
@@ -58,6 +61,7 @@ impl AddError {
                     |name| name.to_string_lossy().into_owned()
                 )
             ),
+            Self::Stale => crate::STALE_REASON.into(),
         }
     }
 }
@@ -96,12 +100,63 @@ impl Basket {
         category: Category,
         size: u64,
     ) -> Result<usize, AddError> {
+        self.insert(path, node, category, size, None, None)
+    }
+
+    /// Adds a leftover after checking `proof` against `inventory`. A container folder is still
+    /// refused by [`crate::safety::check`] on its own; this is the only way it can be added.
+    pub fn add_leftover(
+        &mut self,
+        path: &Path,
+        node: Option<NodeId>,
+        size: u64,
+        proof: &LeftoverProof,
+        inventory: &Inventory,
+    ) -> Result<usize, AddError> {
+        self.insert(
+            path,
+            node,
+            Category::Leftovers,
+            size,
+            Some(proof),
+            Some(inventory),
+        )
+    }
+
+    fn insert(
+        &mut self,
+        path: &Path,
+        node: Option<NodeId>,
+        category: Category,
+        size: u64,
+        proof: Option<&LeftoverProof>,
+        inventory: Option<&Inventory>,
+    ) -> Result<usize, AddError> {
         let path = Places::user_path(path);
         if let Some(outer) = self.items.iter().find(|item| path.starts_with(&item.path)) {
             return Err(AddError::AlreadyInside(outer.path.clone()));
         }
-        let metadata =
-            safety::check(&path, &self.places, &self.scan_root).map_err(AddError::Refused)?;
+        let metadata = match (proof, inventory) {
+            (Some(proof), Some(inventory)) => {
+                proof
+                    .check(&path, inventory, &self.places)
+                    .map_err(|_| AddError::Stale)?;
+                if proof.is_container() {
+                    match safety::check(&path, &self.places, &self.scan_root) {
+                        Ok(metadata) => metadata,
+                        Err(Refusal::ManagedByApp) => {
+                            safety::read_leftover_container(&path, &self.scan_root)
+                                .map_err(AddError::Refused)?
+                        }
+                        Err(refusal) => return Err(AddError::Refused(refusal)),
+                    }
+                } else {
+                    safety::check(&path, &self.places, &self.scan_root)
+                        .map_err(AddError::Refused)?
+                }
+            }
+            _ => safety::check(&path, &self.places, &self.scan_root).map_err(AddError::Refused)?,
+        };
         let before = self.items.len();
         self.items.retain(|item| !item.path.starts_with(&path));
         let replaced = before - self.items.len();
@@ -111,6 +166,7 @@ impl Basket {
             category,
             size,
             identity: Identity::of(&metadata),
+            proof: proof.cloned(),
         });
         Ok(replaced)
     }

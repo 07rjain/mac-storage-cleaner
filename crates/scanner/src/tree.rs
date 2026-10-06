@@ -364,8 +364,33 @@ impl Tree {
         {
             return false;
         }
-        let parent = self.parent(id);
+        // Replacing the root swaps in the new tree. Appending would copy every entry on each
+        // refresh and eventually overflow the name arena.
+        if self.parent(id).is_none() {
+            *self = rescan.clone();
+            return true;
+        }
 
+        let extra_nodes = rescan.nodes.len().saturating_sub(1);
+        let extra_names = rescan
+            .names
+            .len()
+            .saturating_sub(usize::from(rescan.nodes[0].name_len));
+        if self.nodes.len().saturating_add(extra_nodes) > u32::MAX as usize
+            || self.names.len().saturating_add(extra_names) > u32::MAX as usize
+        {
+            self.reclaim();
+        }
+        if self.nodes.len().saturating_add(extra_nodes) > u32::MAX as usize
+            || self.names.len().saturating_add(extra_names) > u32::MAX as usize
+        {
+            return false;
+        }
+
+        let Ok(base) = NodeId::try_from(self.nodes.len()) else {
+            return false;
+        };
+        let parent = self.parent(id);
         let mut old = vec![id];
         while let Some(node) = old.pop() {
             for child in self.children(node).collect::<Vec<_>>() {
@@ -374,7 +399,6 @@ impl Tree {
             }
         }
 
-        let base = NodeId::try_from(self.nodes.len()).expect("more than 4 billion entries");
         let map = |node: NodeId| match node {
             NO_NODE => NO_NODE,
             0 => id,
@@ -383,7 +407,9 @@ impl Tree {
         for node in &rescan.nodes[1..] {
             let name = &rescan.names
                 [node.name_start as usize..node.name_start as usize + usize::from(node.name_len)];
-            let name_start = u32::try_from(self.names.len()).expect("name storage exceeds 4 GiB");
+            let Ok(name_start) = u32::try_from(self.names.len()) else {
+                return false;
+            };
             self.names.extend_from_slice(name);
             self.nodes.push(Node {
                 parent: map(node.parent),
@@ -411,7 +437,56 @@ impl Tree {
             node.items = node.items.saturating_sub(old_items) + new.items;
             current = self.parent(ancestor);
         }
+        if self.nodes.len() > self.live_len().saturating_mul(2) {
+            self.reclaim();
+        }
         true
+    }
+
+    fn live_len(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| !node.flags.contains(NodeFlags::REMOVED))
+            .count()
+    }
+
+    /// Drops removed nodes so a later replace can reuse the arena. Node ids other than the root
+    /// change. Only used on a finished tree.
+    fn reclaim(&mut self) {
+        if !self.complete {
+            return;
+        }
+        let mut fresh = Tree::new(self.root_path.clone());
+        let root = &self.nodes[0];
+        fresh.nodes[0].kind = root.kind;
+        fresh.nodes[0].flags = root.flags;
+        fresh.nodes[0].allocated = root.allocated;
+        fresh.nodes[0].logical = root.logical;
+        fresh.nodes[0].items = root.items;
+        self.copy_live(&mut fresh, self.root(), 0);
+        fresh.stats = self.stats.clone();
+        fresh.finish(true);
+        *self = fresh;
+    }
+
+    fn copy_live(&self, fresh: &mut Tree, old_id: NodeId, new_id: NodeId) {
+        let children: Vec<NodeId> = self
+            .children(old_id)
+            .filter(|&child| !self.flags(child).contains(NodeFlags::REMOVED))
+            .collect();
+        for child in children.into_iter().rev() {
+            let name = self.name(child).as_bytes();
+            let new_child = fresh.insert(
+                new_id,
+                name,
+                self.kind(child),
+                self.flags(child),
+                self.allocated(child),
+                self.logical(child),
+            );
+            fresh.nodes[new_child as usize].items = self.items(child);
+            self.copy_live(fresh, child, new_child);
+        }
     }
 
     pub fn path(&self, id: NodeId) -> PathBuf {
