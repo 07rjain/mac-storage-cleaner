@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-06
+
+### Added
+
+- Cleanup History can put an item this app moved back to its original path. An occupied destination is left alone. Older history rows without an item record have no Put back.
+- Build folders from the same project appear on one review-only card.
+- Exact copies of large files. The newer file is kept, and only a copy that would free its own space is listed. The search can be stopped.
+
 ## [0.2.5] - 2026-10-06
 
 ### Changed

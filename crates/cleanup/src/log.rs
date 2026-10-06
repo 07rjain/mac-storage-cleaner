@@ -3,17 +3,106 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Category, Outcome};
 
+pub const PUT_BACK_UNAVAILABLE: &str =
+    "Put back is unavailable for this cleanup because the history could not be saved.";
+
+impl LoggedItem {
+    pub fn original_path(&self) -> PathBuf {
+        PathBuf::from(std::ffi::OsString::from_vec(self.original.clone()))
+    }
+
+    pub fn trashed_path(&self) -> PathBuf {
+        PathBuf::from(std::ffi::OsString::from_vec(self.trashed.clone()))
+    }
+
+    pub fn can_put_back(&self) -> bool {
+        matches!(self.state, ItemState::Trashed | ItemState::RestoreFailed)
+            && !self.trashed.is_empty()
+    }
+
+    fn capture(
+        path: &Path,
+        trashed: &Path,
+        category: Category,
+        size: u64,
+        id: u64,
+    ) -> Option<Self> {
+        let metadata = std::fs::symlink_metadata(trashed).ok()?;
+        let parent = path.parent()?;
+        let volume = std::fs::symlink_metadata(parent).ok()?.dev();
+        Some(Self {
+            id,
+            original: path.as_os_str().as_bytes().to_vec(),
+            trashed: trashed.as_os_str().as_bytes().to_vec(),
+            volume,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            directory: metadata.is_dir(),
+            symlink: metadata.file_type().is_symlink(),
+            category,
+            size,
+            state: ItemState::Trashed,
+            failure: None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     MovedToTrash,
     DeletedFromTrash,
+    Restored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ItemState {
+    Trashed,
+    Restored,
+    Deleted,
+    RestoreFailed,
+}
+
+impl ItemState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Trashed => "In the Trash",
+            Self::Restored => "Put back",
+            Self::Deleted => "Deleted",
+            Self::RestoreFailed => "Put back failed",
+        }
+    }
+}
+
+/// One file or folder this app moved. Old log lines have no items, and those rows cannot be
+/// put back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedItem {
+    pub id: u64,
+    /// Original path, as filesystem bytes.
+    pub original: Vec<u8>,
+    /// Trash path, as filesystem bytes.
+    pub trashed: Vec<u8>,
+    /// Device id of the original parent, so a different disk at the same path is refused.
+    pub volume: u64,
+    pub device: u64,
+    pub inode: u64,
+    pub directory: bool,
+    pub symlink: bool,
+    pub category: Category,
+    pub size: u64,
+    pub state: ItemState,
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +115,9 @@ pub struct LogEntry {
     pub bytes: u64,
     pub failed: usize,
     pub paths: Vec<String>,
+    /// Per-item recovery records. Missing on logs written before put back existed.
+    #[serde(default)]
+    pub items: Vec<LoggedItem>,
 }
 
 impl LogEntry {
@@ -44,7 +136,9 @@ impl LogEntry {
             bytes: 0,
             failed: 0,
             paths: Vec::new(),
+            items: Vec::new(),
         };
+        let mut next_id = time.saturating_mul(1_000_000);
         for moved in &outcome.moved {
             let entry = by_category
                 .entry(moved.category)
@@ -52,6 +146,13 @@ impl LogEntry {
             entry.count += 1;
             entry.bytes += moved.size;
             entry.paths.push(moved.path.to_string_lossy().into_owned());
+            next_id += 1;
+            if let Some(trashed) = &moved.trashed
+                && let Some(item) =
+                    LoggedItem::capture(&moved.path, trashed, moved.category, moved.size, next_id)
+            {
+                entry.items.push(item);
+            }
         }
         for failed in &outcome.failed {
             by_category
@@ -90,6 +191,21 @@ impl OperationLog {
             lines.push(b'\n');
         }
         file.write_all(&lines)
+    }
+
+    /// Replaces the log with `newest_first`, the same order [`Self::read`] returns.
+    pub fn replace(&self, newest_first: &[LogEntry]) -> io::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = self.path.with_extension("jsonl.tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        for entry in newest_first.iter().rev() {
+            serde_json::to_writer(&mut file, entry)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        std::fs::rename(tmp, &self.path)
     }
 
     /// Newest first. Lines that can't be read are skipped.
@@ -154,5 +270,22 @@ mod tests {
         let read = log.read().unwrap();
         assert_eq!(read.len(), 3);
         assert_eq!(read[0].time, 99);
+        assert!(read.iter().all(|entry| entry.items.is_empty()));
+    }
+
+    #[test]
+    fn old_lines_without_items_still_load() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("cleanup.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"time":1,"action":"MovedToTrash","category":"Logs","count":1,"bytes":4,"failed":0,"paths":["/tmp/a"]}
+"#,
+        )
+        .unwrap();
+        let entries = OperationLog::new(path).read().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].items.is_empty());
+        assert!(!entries[0].items.iter().any(LoggedItem::can_put_back));
     }
 }

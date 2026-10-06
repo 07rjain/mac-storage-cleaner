@@ -1,14 +1,18 @@
 //! The cleanup half of the window: suggestion cards, the basket, the review sheet, the cleanup
 //! history and the item context menu.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use cleanup::{
-    Action, Basket, Category, Inventory, LeftoverProof, LogEntry, ManagedPlace, Opener,
-    OperationLog, Outcome, Places, RunningApps, Safety, Suggestion,
+    Action, Basket, Category, CopyReport, CopySearch, Inventory, ItemState, LeftoverProof,
+    LogEntry, LoggedItem, ManagedPlace, Opener, OperationLog, Outcome, PUT_BACK_UNAVAILABLE,
+    Places, RunningApps, Safety, Suggestion, put_back_items,
 };
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseDownEvent, Pixels, Point, Render, Role,
@@ -21,6 +25,15 @@ use crate::format;
 use crate::model::Item;
 use crate::theme::Theme;
 use crate::widgets::{badge, button, primary_button};
+
+/// Path, scan node, size, leftover proof, and exact-copy proof for one basket add.
+type BasketAdd = (
+    PathBuf,
+    Option<NodeId>,
+    u64,
+    Option<LeftoverProof>,
+    Option<cleanup::CopyProof>,
+);
 
 /// Rows shown at most in one sheet; the rest are summarized.
 const SHEET_ROWS: usize = 300;
@@ -62,6 +75,8 @@ pub(super) struct CleanupResult {
     deleting: bool,
     deleted: bool,
     delete_failures: usize,
+    records: Vec<LoggedItem>,
+    put_back_unavailable: bool,
 }
 
 impl CleanupResult {
@@ -91,8 +106,11 @@ pub(super) struct Cleanup {
     history: Vec<LogEntry>,
     _measure: Option<Task<()>>,
     _suggest: Option<Task<()>>,
+    copies_running: bool,
+    copies_stop: Option<Arc<AtomicBool>>,
     _add: Option<Task<()>>,
     _work: Option<Task<()>>,
+    _copies: Option<Task<()>>,
     _notice: Option<Task<()>>,
 }
 
@@ -115,8 +133,11 @@ impl Cleanup {
             history: Vec::new(),
             _measure: None,
             _suggest: None,
+            copies_running: false,
+            copies_stop: None,
             _add: None,
             _work: None,
+            _copies: None,
             _notice: None,
         }
     }
@@ -133,9 +154,15 @@ impl Cleanup {
         if self.sheet != Some(Sheet::History) {
             self.sheet = None;
         }
+        if let Some(stop) = &self.copies_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.copies_running = false;
+        self.copies_stop = None;
         self._measure = None;
         self._suggest = None;
         self._add = None;
+        self._copies = None;
     }
 
     fn basket_len(&self) -> usize {
@@ -213,7 +240,11 @@ impl StorageView {
     pub(super) fn add_item(&mut self, item: Item, cx: &mut Context<Self>) {
         match self.item_target(item) {
             Some((path, size, node)) => {
-                self.add_to_basket(vec![(path, Some(node), size, None)], Category::Chosen, cx);
+                self.add_to_basket(
+                    vec![(path, Some(node), size, None, None)],
+                    Category::Chosen,
+                    cx,
+                );
             }
             None => self.show_notice("Only files and folders can go in the basket", cx),
         }
@@ -232,7 +263,7 @@ impl StorageView {
     /// Adds items, and says why any were refused. Returns how many were added.
     fn add_to_basket(
         &mut self,
-        items: Vec<(PathBuf, Option<NodeId>, u64, Option<LeftoverProof>)>,
+        items: Vec<BasketAdd>,
         category: Category,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -250,8 +281,13 @@ impl StorageView {
             };
             let mut added = 0;
             let mut refused = Vec::new();
-            for (path, node, size, _) in items {
-                match basket.add(&path, node, category, size) {
+            for (path, node, size, _, copy) in items {
+                let added_one = if let Some(copy) = copy.as_ref() {
+                    basket.add_copy(&path, node, size, copy)
+                } else {
+                    basket.add(&path, node, category, size)
+                };
+                match added_one {
                     Ok(_) => added += 1,
                     Err(error) => refused.push((path, error.reason())),
                 }
@@ -263,11 +299,7 @@ impl StorageView {
     }
 
     /// Leftover proofs are checked against a fresh Applications inventory, off the main thread.
-    fn add_checked_leftovers(
-        &mut self,
-        items: Vec<(PathBuf, Option<NodeId>, u64, Option<LeftoverProof>)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn add_checked_leftovers(&mut self, items: Vec<BasketAdd>, cx: &mut Context<Self>) {
         let Some(home) = self
             .cleanup
             .places
@@ -300,7 +332,7 @@ impl StorageView {
 
     fn finish_leftover_add(
         &mut self,
-        items: Vec<(PathBuf, Option<NodeId>, u64, Option<LeftoverProof>)>,
+        items: Vec<BasketAdd>,
         inventory: &Inventory,
         cx: &mut Context<Self>,
     ) {
@@ -310,7 +342,7 @@ impl StorageView {
             };
             let mut added = 0;
             let mut refused = Vec::new();
-            for (path, node, size, proof) in items {
+            for (path, node, size, proof, _copy) in items {
                 if basket.contains(&path) {
                     continue;
                 }
@@ -454,6 +486,7 @@ impl StorageView {
                     view.cleanup.suggestions = Rc::new(suggestions);
                     view.cleanup.managed = Rc::new(managed);
                     view.cleanup.suggesting = false;
+                    view.start_copies(cx);
                     cx.notify();
                 }
             });
@@ -476,6 +509,7 @@ impl StorageView {
                         Some(item.node),
                         item.size,
                         item.proof.clone(),
+                        item.copy.clone(),
                     )
                 })
                 .collect();
@@ -499,6 +533,7 @@ impl StorageView {
                     Some(item.node),
                     item.size,
                     item.proof.clone(),
+                    item.copy.clone(),
                 )
             })
             .collect();
@@ -521,6 +556,7 @@ impl StorageView {
                     Some(item.node),
                     item.size,
                     item.proof.clone(),
+                    item.copy.clone(),
                 )],
                 suggestion.category,
                 cx,
@@ -549,6 +585,165 @@ impl StorageView {
     pub(super) fn open_basket(&mut self, cx: &mut Context<Self>) {
         self.cleanup.menu = None;
         self.cleanup.sheet = Some(Sheet::Basket);
+        cx.notify();
+    }
+
+    fn start_copies(&mut self, cx: &mut Context<Self>) {
+        if let Some(stop) = &self.cleanup.copies_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let (Some(scan), Some(places)) = (&self.scan, self.cleanup.places.clone()) else {
+            return;
+        };
+        let shared = scan.handle.shared_tree();
+        let generation = self.generation;
+        let claimed: HashSet<NodeId> = self
+            .cleanup
+            .suggestions
+            .iter()
+            .flat_map(|suggestion| suggestion.items.iter().map(|item| item.node))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        self.cleanup.copies_stop = Some(Arc::clone(&stop));
+        self.cleanup.copies_running = true;
+        self.set_copies(Vec::new(), vec![CopyReport::progress(0, 0)]);
+        self.cleanup._copies = Some(cx.spawn(async move |this, cx| {
+            let mut search = cx
+                .background_executor()
+                .spawn({
+                    let shared = shared.clone();
+                    let places = places.clone();
+                    async move {
+                        let tree = shared.read();
+                        CopySearch::start(&tree, &places, &claimed)
+                    }
+                })
+                .await;
+            loop {
+                let flag = Arc::clone(&stop);
+                let (next, more, checked, total) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let more = search.step(&flag);
+                        let checked = search.checked();
+                        let total = search.total();
+                        (search, more, checked, total)
+                    })
+                    .await;
+                search = next;
+                let current = this.update(cx, |view, cx| {
+                    if view.generation != generation {
+                        return false;
+                    }
+                    view.set_copies(Vec::new(), vec![CopyReport::progress(checked, total)]);
+                    cx.notify();
+                    true
+                });
+                if !current.unwrap_or(false) {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if !more {
+                    let report = search.finish();
+                    let _ = this.update(cx, |view, cx| {
+                        if view.generation != generation {
+                            return;
+                        }
+                        view.cleanup.copies_running = false;
+                        let skipped = report.skipped();
+                        view.set_copies(report.items, skipped);
+                        cx.notify();
+                    });
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn stop_copies(&mut self, cx: &mut Context<Self>) {
+        if let Some(stop) = &self.cleanup.copies_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+        cx.notify();
+    }
+
+    fn set_copies(&mut self, items: Vec<cleanup::Candidate>, skipped: Vec<String>) {
+        let mut suggestions = (*self.cleanup.suggestions).clone();
+        suggestions.retain(|suggestion| suggestion.category != Category::ExactCopies);
+        suggestions.push(Suggestion {
+            category: Category::ExactCopies,
+            items,
+            skipped,
+            title_override: None,
+            reason_override: None,
+        });
+        self.cleanup.suggestions = Rc::new(suggestions);
+    }
+
+    fn put_back_history(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(log) = self.cleanup.log.clone() else {
+            return;
+        };
+        let Some(home) = self
+            .cleanup
+            .places
+            .as_ref()
+            .map(|places| places.home.clone())
+        else {
+            return;
+        };
+        let mut entries = self.cleanup.history.clone();
+        self.cleanup._work = Some(cx.spawn(async move |this, cx| {
+            let entries = cx
+                .background_executor()
+                .spawn(async move {
+                    let Some(entry) = entries.get_mut(index) else {
+                        return entries;
+                    };
+                    let before = entry
+                        .items
+                        .iter()
+                        .filter(|item| item.state == ItemState::Restored)
+                        .count();
+                    let category = entry.category;
+                    let time = SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    put_back_items(&mut entry.items, &home);
+                    let restored: Vec<_> = entry
+                        .items
+                        .iter()
+                        .filter(|item| item.state == ItemState::Restored)
+                        .skip(before)
+                        .cloned()
+                        .collect();
+                    if !restored.is_empty() {
+                        entries.insert(
+                            0,
+                            LogEntry {
+                                time,
+                                action: Action::Restored,
+                                category,
+                                count: restored.len(),
+                                bytes: restored.iter().map(|item| item.size).sum(),
+                                failed: 0,
+                                paths: restored
+                                    .iter()
+                                    .map(|item| item.original_path().to_string_lossy().into_owned())
+                                    .collect(),
+                                items: Vec::new(),
+                            },
+                        );
+                    }
+                    entries
+                })
+                .await;
+            if let Err(error) = log.replace(&entries) {
+                tracing::warn!(kind = ?error.kind(), "writing the cleanup log failed");
+            }
+            let _ = this.update(cx, |view, cx| view.open_history(cx));
+        }));
         cx.notify();
     }
 
@@ -737,11 +932,21 @@ impl StorageView {
                 basket.remove(&moved.path);
             }
         }
-        if let Some(log) = &self.cleanup.log
-            && let Err(error) = log.append(&LogEntry::from_outcome(&outcome, SystemTime::now()))
-        {
-            tracing::warn!(kind = ?error.kind(), "writing the cleanup log failed");
-        }
+        let entries = LogEntry::from_outcome(&outcome, SystemTime::now());
+        let (records, put_back_unavailable) = if let Some(log) = &self.cleanup.log {
+            match log.append(&entries) {
+                Ok(()) => (
+                    entries.into_iter().flat_map(|entry| entry.items).collect(),
+                    false,
+                ),
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), "writing the cleanup log failed");
+                    (Vec::new(), true)
+                }
+            }
+        } else {
+            (Vec::new(), true)
+        };
         self.cleanup.result = Some(CleanupResult {
             outcome,
             will_free,
@@ -752,6 +957,8 @@ impl StorageView {
             deleting: false,
             deleted: false,
             delete_failures: 0,
+            records,
+            put_back_unavailable,
         });
         self.cleanup.sheet = Some(Sheet::Basket);
         self.tree_changed(cx);
@@ -810,12 +1017,21 @@ impl StorageView {
         if result.deleting || result.deleted {
             return;
         }
-        let paths: Vec<PathBuf> = result
-            .outcome
-            .moved
-            .iter()
-            .filter_map(|moved| moved.trashed.clone())
-            .collect();
+        let paths: Vec<PathBuf> = if result.put_back_unavailable {
+            result
+                .outcome
+                .moved
+                .iter()
+                .filter_map(|moved| moved.trashed.clone())
+                .collect()
+        } else {
+            result
+                .records
+                .iter()
+                .filter(|item| item.state == ItemState::Trashed)
+                .map(LoggedItem::trashed_path)
+                .collect()
+        };
         result.deleting = true;
         let root = self.scope.root();
         self.cleanup._work = Some(cx.spawn(async move |this, cx| {
@@ -827,20 +1043,75 @@ impl StorageView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if let Some(result) = &mut view.cleanup.result {
+                let saved = if let Some(result) = &mut view.cleanup.result {
                     result.deleting = false;
                     result.deleted = true;
                     result.available_after = after;
                     result.delete_failures = failures.len();
+                    for record in &mut result.records {
+                        if record.state != ItemState::Trashed {
+                            continue;
+                        }
+                        let failed = failures
+                            .iter()
+                            .any(|(path, _)| path == &record.trashed_path());
+                        if failed {
+                            record.failure = Some("Couldn't delete it from the Trash".into());
+                        } else {
+                            record.state = ItemState::Deleted;
+                            record.failure = None;
+                        }
+                    }
+                    let records = result.records.clone();
                     let mut entries = LogEntry::from_outcome(&result.outcome, SystemTime::now());
                     for entry in &mut entries {
                         entry.action = Action::DeletedFromTrash;
-                        entry.failed = 0;
+                        entry.failed = if result.put_back_unavailable {
+                            result
+                                .outcome
+                                .moved
+                                .iter()
+                                .filter(|moved| {
+                                    moved.category == entry.category
+                                        && moved.trashed.as_ref().is_some_and(|path| {
+                                            failures.iter().any(|(failed, _)| failed == path)
+                                        })
+                                })
+                                .count()
+                        } else {
+                            records
+                                .iter()
+                                .filter(|item| {
+                                    item.category == entry.category
+                                        && item.state == ItemState::Trashed
+                                        && item.failure.is_some()
+                                })
+                                .count()
+                        };
                     }
                     entries.retain(|entry| entry.count > 0);
-                    if let Some(log) = &view.cleanup.log
-                        && let Err(error) = log.append(&entries)
-                    {
+                    Some((records, entries))
+                } else {
+                    None
+                };
+                if let Some((records, entries)) = saved
+                    && let Some(log) = &view.cleanup.log
+                {
+                    if let Ok(mut history) = log.read() {
+                        for entry in &mut history {
+                            for item in &mut entry.items {
+                                if let Some(updated) =
+                                    records.iter().find(|record| record.id == item.id)
+                                {
+                                    *item = updated.clone();
+                                }
+                            }
+                        }
+                        if let Err(error) = log.replace(&history) {
+                            tracing::warn!(kind = ?error.kind(), "writing the cleanup log failed");
+                        }
+                    }
+                    if let Err(error) = log.append(&entries) {
                         tracing::warn!(kind = ?error.kind(), "writing the cleanup log failed");
                     }
                 }
@@ -999,10 +1270,7 @@ impl StorageView {
         div()
             .id(("suggestion", index))
             .role(Role::Button)
-            .aria_label(format!(
-                "{}, {detail}, {label}",
-                suggestion.category.title()
-            ))
+            .aria_label(format!("{}, {detail}, {label}", suggestion.title()))
             .flex_none()
             .w(px(220.))
             .h(px(CARD_HEIGHT))
@@ -1021,7 +1289,7 @@ impl StorageView {
                 div()
                     .truncate()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(suggestion.category.title()),
+                    .child(suggestion.title().to_string()),
             )
             .child(
                 div()
@@ -1301,12 +1569,15 @@ impl StorageView {
             Sheet::Suggestion(index) => {
                 let suggestion = self.cleanup.suggestions.get(index)?.clone();
                 (
-                    suggestion.category.title().into(),
+                    suggestion.title().into(),
                     self.render_suggestion_sheet(index, &suggestion, theme, cx),
                 )
             }
             Sheet::Basket => ("Review basket".into(), self.render_basket_sheet(theme, cx)),
-            Sheet::History => ("Cleanup history".into(), self.render_history_sheet(theme)),
+            Sheet::History => (
+                "Cleanup history".into(),
+                self.render_history_sheet(theme, cx),
+            ),
         };
         let card =
             div()
@@ -1417,7 +1688,7 @@ impl StorageView {
                     .id("suggestion-reason")
                     .role(Role::Group)
                     .aria_label(
-                        std::iter::once(suggestion.category.reason().to_string())
+                        std::iter::once(suggestion.reason().to_string())
                             .chain(suggestion.skipped.iter().cloned())
                             .collect::<Vec<_>>()
                             .join(" "),
@@ -1427,7 +1698,7 @@ impl StorageView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(suggestion.category.reason())
+                    .child(suggestion.reason().to_string())
                     .children(
                         suggestion.skipped.iter().map(|note| {
                             div().text_xs().text_color(theme.muted).child(note.clone())
@@ -1449,6 +1720,14 @@ impl StorageView {
                         format::bytes(suggestion.size()),
                         format::items(suggestion.items.len() as u64)
                     )))
+                    .when(
+                        self.cleanup.copies_running && suggestion.category == Category::ExactCopies,
+                        |this| {
+                            this.child(button("stop-copies", "Stop", theme).on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.stop_copies(cx)),
+                            ))
+                        },
+                    )
                     .child(
                         primary_button(
                             "add-all",
@@ -1732,7 +2011,11 @@ impl StorageView {
                 .will_free
                 .map(|bytes| format!(" (frees about {})", format::bytes(bytes)))
                 .unwrap_or_default();
-            let still = "They still take up space until the Trash is emptied. You can put them back from the Trash in Finder.";
+            let still = if result.put_back_unavailable {
+                PUT_BACK_UNAVAILABLE
+            } else {
+                "They still take up space until the Trash is emptied. Put them back from Cleanup History."
+            };
             let trash_note = result.trash_size.map(|size| {
                 format!(
                     "The Trash holds {} in all. Emptying it in Finder deletes everything in it, not just these items.",
@@ -1773,7 +2056,7 @@ impl StorageView {
             .aria_label(spoken.join(" "))
     }
 
-    fn render_history_sheet(&self, theme: &Theme) -> AnyElement {
+    fn render_history_sheet(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut rows = div()
             .id("history-rows")
             .flex_1()
@@ -1794,7 +2077,9 @@ impl StorageView {
             let action = match entry.action {
                 Action::MovedToTrash => "Moved to Trash",
                 Action::DeletedFromTrash => "Deleted from Trash",
+                Action::Restored => "Put back",
             };
+            let can_restore = entry.items.iter().any(LoggedItem::can_put_back);
             let mut summary = format!(
                 "{action} · {} · {} · {}",
                 entry.category.title(),
@@ -1834,6 +2119,29 @@ impl StorageView {
                                 .text_color(theme.muted)
                                 .child(format!("and {} more", entry.paths.len() - 3)),
                         )
+                    })
+                    .children(entry.items.iter().take(8).map(|item| {
+                        let mut line = format!(
+                            "{} · {}",
+                            display_path(&item.original_path()),
+                            item.state.label()
+                        );
+                        if let Some(failure) = &item.failure {
+                            line.push_str(" · ");
+                            line.push_str(failure);
+                        }
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .truncate()
+                            .child(line)
+                    }))
+                    .when(can_restore, |this| {
+                        this.child(button(("put-back", index), "Put back", theme).on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.put_back_history(index, cx);
+                            }),
+                        ))
                     }),
             );
         }

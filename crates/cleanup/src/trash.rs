@@ -65,6 +65,12 @@ pub fn move_to_trash(
             outcome.failed.push(fail(reason.into()));
             continue;
         }
+        if let Some(copy) = &item.copy
+            && let Err(reason) = copy.check(&item.path, items)
+        {
+            outcome.failed.push(fail(reason));
+            continue;
+        }
         let metadata = match safety::check(&item.path, places, scan_root) {
             Ok(metadata) => metadata,
             Err(Refusal::ManagedByApp)
@@ -180,7 +186,11 @@ fn trash_error_reason(domain: &str, code: isize) -> String {
 pub fn delete_permanently(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
     let mut failures = Vec::new();
     for path in paths {
-        if !is_in_trash(path) {
+        let Some(home) = std::env::home_dir() else {
+            failures.push((path.clone(), "Not in the Trash".into()));
+            continue;
+        };
+        if !is_in_trash(path, &home) {
             failures.push((path.clone(), "Not in the Trash".into()));
             continue;
         }
@@ -202,13 +212,11 @@ pub fn delete_permanently(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
 }
 
 /// `~/.Trash/<item>` or `/Volumes/<volume>/.Trashes/<uid>/<item>`.
-fn is_in_trash(path: &Path) -> bool {
+pub(crate) fn is_in_trash(path: &Path, home: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
-    if let Some(home) = std::env::home_dir()
-        && parent == home.join(".Trash")
-    {
+    if parent == home.join(".Trash") {
         return true;
     }
     parent

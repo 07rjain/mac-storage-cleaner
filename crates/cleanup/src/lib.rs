@@ -3,10 +3,12 @@
 //! path goes through [`safety`] first.
 
 mod basket;
+mod copies;
 mod inventory;
 mod log;
 mod managed;
 mod processes;
+mod restore;
 pub mod safety;
 mod suggest;
 mod trash;
@@ -16,10 +18,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use basket::{AddError, Basket, BasketItem};
+pub use copies::{CopyEnd, CopyProof, CopyReport, CopySearch};
 pub use inventory::{Inventory, LeftoverProof, STALE_REASON};
-pub use log::{Action, LogEntry, OperationLog};
+pub use log::{Action, ItemState, LogEntry, LoggedItem, OperationLog, PUT_BACK_UNAVAILABLE};
 pub use managed::{ManagedKind, ManagedPlace, Opener, managed_places};
 pub use processes::RunningApps;
+pub use restore::{RestoreFailure, put_back, put_back_at, put_back_items};
 pub use safety::Refusal;
 pub use suggest::{Candidate, Suggestion, suggest};
 pub use trash::{Failed, Moved, Outcome, delete_permanently, move_to_trash};
@@ -37,6 +41,8 @@ pub enum Category {
     LargeFiles,
     /// Support files for a bundle ID that was not found under Applications.
     Leftovers,
+    /// An older exact copy whose removal would free private space.
+    ExactCopies,
     /// Added by the user from the chart or the list.
     Chosen,
 }
@@ -60,6 +66,7 @@ impl Category {
             Self::Logs => "Logs",
             Self::LargeFiles => "Large files",
             Self::Leftovers => "Leftover files not tied to an installed app",
+            Self::ExactCopies => "Exact copies",
             Self::Chosen => "Chosen by you",
         }
     }
@@ -88,6 +95,9 @@ impl Category {
             Self::LargeFiles => "Files of 1 GB or more; check each one",
             Self::Leftovers => {
                 "Bundle IDs not found under Applications on this Mac. A cache is recreated; other folders may contain saved data"
+            }
+            Self::ExactCopies => {
+                "Identical files. Only a copy that would free its own space is listed"
             }
             Self::Chosen => "Items you added",
         }

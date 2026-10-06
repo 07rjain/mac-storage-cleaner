@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use scanner::NodeId;
 
+use crate::copies::CopyProof;
 use crate::safety::{self, Refusal};
 use crate::{Category, Inventory, LeftoverProof, Places};
 
@@ -39,6 +40,7 @@ pub struct BasketItem {
     pub size: u64,
     pub(crate) identity: Identity,
     pub(crate) proof: Option<LeftoverProof>,
+    pub(crate) copy: Option<CopyProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,8 @@ pub enum AddError {
     AlreadyInside(PathBuf),
     /// The leftover proof no longer matches the app list or the folder.
     Stale,
+    /// The exact-copy check failed.
+    Copy(String),
 }
 
 impl AddError {
@@ -62,6 +66,7 @@ impl AddError {
                 )
             ),
             Self::Stale => crate::STALE_REASON.into(),
+            Self::Copy(reason) => reason.clone(),
         }
     }
 }
@@ -72,6 +77,13 @@ pub struct Basket {
     /// User path of the scanned folder; links may not point outside it.
     scan_root: PathBuf,
     items: Vec<BasketItem>,
+}
+
+/// Why a path is allowed into the basket, checked inside `insert`.
+enum Admission<'a> {
+    Plain,
+    Leftover(&'a LeftoverProof, &'a Inventory),
+    Copy(&'a CopyProof),
 }
 
 impl Basket {
@@ -100,7 +112,24 @@ impl Basket {
         category: Category,
         size: u64,
     ) -> Result<usize, AddError> {
-        self.insert(path, node, category, size, None, None)
+        self.insert(path, node, category, size, Admission::Plain)
+    }
+
+    /// Adds an exact copy after checking that the kept file is still the same.
+    pub fn add_copy(
+        &mut self,
+        path: &Path,
+        node: Option<NodeId>,
+        size: u64,
+        copy: &CopyProof,
+    ) -> Result<usize, AddError> {
+        self.insert(
+            path,
+            node,
+            Category::ExactCopies,
+            size,
+            Admission::Copy(copy),
+        )
     }
 
     /// Adds a leftover after checking `proof` against `inventory`. A container folder is still
@@ -118,8 +147,7 @@ impl Basket {
             node,
             Category::Leftovers,
             size,
-            Some(proof),
-            Some(inventory),
+            Admission::Leftover(proof, inventory),
         )
     }
 
@@ -129,15 +157,19 @@ impl Basket {
         node: Option<NodeId>,
         category: Category,
         size: u64,
-        proof: Option<&LeftoverProof>,
-        inventory: Option<&Inventory>,
+        admission: Admission<'_>,
     ) -> Result<usize, AddError> {
         let path = Places::user_path(path);
+        if let Admission::Copy(copy) = admission
+            && let Err(reason) = copy.check(&path, &self.items)
+        {
+            return Err(AddError::Copy(reason));
+        }
         if let Some(outer) = self.items.iter().find(|item| path.starts_with(&item.path)) {
             return Err(AddError::AlreadyInside(outer.path.clone()));
         }
-        let metadata = match (proof, inventory) {
-            (Some(proof), Some(inventory)) => {
+        let metadata = match admission {
+            Admission::Leftover(proof, inventory) => {
                 proof
                     .check(&path, inventory, &self.places)
                     .map_err(|_| AddError::Stale)?;
@@ -155,18 +187,26 @@ impl Basket {
                         .map_err(AddError::Refused)?
                 }
             }
-            _ => safety::check(&path, &self.places, &self.scan_root).map_err(AddError::Refused)?,
+            Admission::Plain | Admission::Copy(_) => {
+                safety::check(&path, &self.places, &self.scan_root).map_err(AddError::Refused)?
+            }
         };
         let before = self.items.len();
         self.items.retain(|item| !item.path.starts_with(&path));
         let replaced = before - self.items.len();
+        let (proof, copy) = match admission {
+            Admission::Leftover(proof, _) => (Some(proof.clone()), None),
+            Admission::Copy(copy) => (None, Some(copy.clone())),
+            Admission::Plain => (None, None),
+        };
         self.items.push(BasketItem {
             path,
             node,
             category,
             size,
             identity: Identity::of(&metadata),
-            proof: proof.cloned(),
+            proof,
+            copy,
         });
         Ok(replaced)
     }

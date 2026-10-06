@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use scanner::{NodeFlags, NodeId, NodeKind, Tree};
 
+use crate::copies::CopyProof;
 use crate::{Category, Inventory, LeftoverProof, Places, RunningApps, Safety, managed, safety};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -101,6 +102,8 @@ pub struct Candidate {
     pub note: Option<String>,
     /// Set for leftovers. Basket add and the Trash move both check it again.
     pub proof: Option<LeftoverProof>,
+    /// Set for an exact copy. The Trash move checks the kept file again.
+    pub copy: Option<CopyProof>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,11 +112,26 @@ pub struct Suggestion {
     pub items: Vec<Candidate>,
     /// What was left out and why, for example caches of running apps.
     pub skipped: Vec<String>,
+    /// Project cards use the project folder name instead of the category title.
+    pub title_override: Option<String>,
+    pub reason_override: Option<String>,
 }
 
 impl Suggestion {
     pub fn size(&self) -> u64 {
         self.items.iter().map(|item| item.size).sum()
+    }
+
+    pub fn title(&self) -> &str {
+        self.title_override
+            .as_deref()
+            .unwrap_or_else(|| self.category.title())
+    }
+
+    pub fn reason(&self) -> &str {
+        self.reason_override
+            .as_deref()
+            .unwrap_or_else(|| self.category.reason())
     }
 
     /// Safe categories go in the basket as a whole when the card is clicked; the others open
@@ -145,12 +163,14 @@ pub fn suggest(
         rules.device_support(),
         rules.archives(),
         rules.package_caches(),
-        rules.build_folders(),
+    ];
+    suggestions.extend(rules.build_folders());
+    suggestions.extend([
         rules.leftovers(inventory),
         rules.app_caches(),
         rules.logs(),
         rules.large_files(),
-    ];
+    ]);
     suggestions.retain(|suggestion| !suggestion.items.is_empty() || !suggestion.skipped.is_empty());
     for suggestion in &mut suggestions {
         suggestion
@@ -220,6 +240,7 @@ impl Rules<'_> {
             size: self.tree.allocated(id),
             note,
             proof: None,
+            copy: None,
         }
     }
 
@@ -238,6 +259,8 @@ impl Rules<'_> {
             category,
             items,
             skipped,
+            title_override: None,
+            reason_override: None,
         }
     }
 
@@ -363,9 +386,9 @@ impl Rules<'_> {
         self.finish(Category::PackageCaches, items, skipped)
     }
 
-    fn build_folders(&mut self) -> Suggestion {
+    fn build_folders(&mut self) -> Vec<Suggestion> {
         let Some(home) = self.search_root() else {
-            return self.finish(Category::BuildFolders, Vec::new(), Vec::new());
+            return vec![self.finish(Category::BuildFolders, Vec::new(), Vec::new())];
         };
         let mut found = Vec::new();
         let mut stack: Vec<NodeId> = self
@@ -390,6 +413,7 @@ impl Rules<'_> {
             stack.extend(self.tree.children(id));
         }
         found.sort_by_key(|&(id, _)| std::cmp::Reverse(self.tree.allocated(id)));
+        let mut capped = found.len() > MAX_BUILD_FOLDERS_CHECKED;
         found.truncate(MAX_BUILD_FOLDERS_CHECKED);
 
         let mut items = Vec::new();
@@ -423,12 +447,76 @@ impl Rules<'_> {
                 .unwrap_or_default();
             items.push(self.candidate(id, Some(format!("{kind} in {project}, {}", age_note(age)))));
         }
-        let skipped = if in_git > 0 {
-            vec![format!("Skipped {in_git} tracked by Git or not checkable")]
-        } else {
-            Vec::new()
-        };
-        self.finish(Category::BuildFolders, items, skipped)
+        if items.len() > MAX_ITEMS {
+            capped = true;
+            items.truncate(MAX_ITEMS);
+        }
+        let mut skipped = Vec::new();
+        if in_git > 0 {
+            skipped.push(format!("Skipped {in_git} tracked by Git or not checkable"));
+        }
+        if capped {
+            skipped.push("The list was cut.".into());
+        }
+        if items.is_empty() {
+            return vec![self.finish(Category::BuildFolders, items, skipped)];
+        }
+        self.project_cards(items, skipped)
+    }
+
+    fn project_cards(&mut self, items: Vec<Candidate>, skipped: Vec<String>) -> Vec<Suggestion> {
+        const REASON: &str = "Dependencies and build output in this project, untouched for 7 days at the top of the folder and not in Git. The next build recreates them.";
+        let mut groups: std::collections::BTreeMap<PathBuf, Vec<Candidate>> =
+            std::collections::BTreeMap::new();
+        for item in items {
+            let project = item
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| item.path.clone());
+            groups.entry(project).or_default().push(item);
+        }
+        let mut names = std::collections::HashMap::<std::ffi::OsString, usize>::new();
+        for project in groups.keys() {
+            if let Some(name) = project.file_name() {
+                *names.entry(name.to_os_string()).or_default() += 1;
+            }
+        }
+        let mut cards = Vec::new();
+        for (index, (project, mut folder_items)) in groups.into_iter().enumerate() {
+            folder_items.sort_by_key(|item| std::cmp::Reverse(item.size));
+            self.taken.extend(folder_items.iter().map(|item| item.node));
+            let name = project
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Project".into());
+            let shared = project
+                .file_name()
+                .and_then(|name| names.get(name))
+                .is_some_and(|count| *count > 1);
+            let title = if shared {
+                let parent = project
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!("{name} · {parent}")
+            } else {
+                name
+            };
+            cards.push(Suggestion {
+                category: Category::BuildFolders,
+                items: folder_items,
+                skipped: if index == 0 {
+                    skipped.clone()
+                } else {
+                    Vec::new()
+                },
+                title_override: Some(title),
+                reason_override: Some(REASON.into()),
+            });
+        }
+        cards
     }
 
     fn build_folder_kind(&self, id: NodeId) -> Option<&'static str> {
@@ -535,6 +623,8 @@ impl Rules<'_> {
                 category: Category::Leftovers,
                 items,
                 skipped: Vec::new(),
+                title_override: None,
+                reason_override: None,
             };
         }
         let mut skipped = Vec::new();

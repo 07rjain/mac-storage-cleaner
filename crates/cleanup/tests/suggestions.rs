@@ -77,21 +77,17 @@ fn suggestions(home: &Path, running: &RunningApps, inventory: &Inventory) -> Vec
 fn names(suggestions: &[Suggestion], category: Category) -> Vec<String> {
     suggestions
         .iter()
-        .find(|suggestion| suggestion.category == category)
-        .map(|suggestion| {
-            suggestion
-                .items
-                .iter()
-                .map(|item| {
-                    item.path
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect()
+        .filter(|suggestion| suggestion.category == category)
+        .flat_map(|suggestion| {
+            suggestion.items.iter().map(|item| {
+                item.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 #[test]
@@ -190,4 +186,76 @@ fn suggested_items_never_overlap_and_all_pass_the_safety_rules() {
             assert!(!path.starts_with(other) && !other.starts_with(path));
         }
     }
+}
+
+#[test]
+fn build_folders_are_one_card_per_project() {
+    let home = tempfile::tempdir().unwrap();
+    let path = |relative: &str| home.path().join(relative);
+    let project = |relative: &str| {
+        write(&path(&format!("{relative}/package.json")), 20);
+        write(
+            &path(&format!("{relative}/node_modules/pkg/index.js")),
+            11_000_000,
+        );
+        age(&path(&format!("{relative}/node_modules")), 30);
+        age(&path(&format!("{relative}/node_modules/pkg")), 30);
+    };
+    project("code/site");
+    write(&path("code/site/dist/app.js"), 11_000_000);
+    age(&path("code/site/dist"), 30);
+    age(&path("code/site/dist/app.js"), 30);
+    project("work/a/widget");
+    project("work/b/widget");
+    write(&path("rust/plain/Cargo.toml"), 20);
+    write(&path("rust/plain/target/debug/app"), 11_000_000);
+    age(&path("rust/plain/target"), 30);
+    write(&path("rust/ready/Cargo.toml"), 20);
+    write(&path("rust/ready/target/CACHEDIR.TAG"), 10);
+    write(&path("rust/ready/target/debug/app"), 11_000_000);
+    age(&path("rust/ready/target"), 30);
+    age(&path("rust/ready/target/debug"), 30);
+    age(&path("rust/ready/target/CACHEDIR.TAG"), 30);
+
+    let found = suggestions(
+        home.path(),
+        &RunningApps::default(),
+        &Inventory::known(Vec::<String>::new()),
+    );
+    let cards: Vec<_> = found
+        .iter()
+        .filter(|suggestion| suggestion.category == Category::BuildFolders)
+        .collect();
+    let site = cards
+        .iter()
+        .find(|card| card.title() == "site")
+        .expect("site card");
+    let mut site_names: Vec<_> = site
+        .items
+        .iter()
+        .map(|item| {
+            item.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    site_names.sort();
+    assert_eq!(site_names, ["dist", "node_modules"]);
+    assert!(site.reason().contains("next build recreates them"));
+    assert!(
+        site.items[0]
+            .path
+            .starts_with(home.path().join("code/site"))
+    );
+    assert!(cards.iter().any(|card| card.title() == "widget · a"));
+    assert!(cards.iter().any(|card| card.title() == "widget · b"));
+    assert!(cards.iter().all(|card| {
+        !card
+            .items
+            .iter()
+            .any(|item| item.path.ends_with("rust/plain/target"))
+    }));
+    assert!(cards.iter().any(|card| card.title() == "ready"));
 }

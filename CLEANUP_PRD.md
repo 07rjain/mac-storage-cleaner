@@ -2,7 +2,7 @@
 
 Status: Draft · Owner: Rishabh · Date: 2026-10-06 · Revised after review `task_1313eb8f-e01c-442f-a4f7-308e723f4f4b`
 
-Leftovers (section 5) are in the app. Put back, project cards, and exact copies are not.
+Leftovers (section 5), put back (section 6), project cards (section 7), and exact copies (section 8) are in the app.
 
 This is the spec for the next cleanup work. The product PRD (`PRD.md`) still governs scanning, charts, Sentry, and the v1 cleanup that already shipped. Where this document is silent, those rules stand. Section 5.3 narrows a refusal in `PRD.md` section 8.3: one proven leftover container, rechecked when it is added and when it is moved.
 

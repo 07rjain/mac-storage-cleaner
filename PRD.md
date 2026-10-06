@@ -41,7 +41,7 @@ The product has three promises:
 - Deleting local snapshots or forcing a purge.
 - Any iCloud feature (deferred to Future, see section 13): showing what is only in iCloud, evicting or downloading files, toggling Optimize Mac Storage, or analyzing the iCloud account or quota.
 - Opening up the Photos library, iOS backups, Mail or Messages data.
-- Uninstalling an app that is still installed. Leftovers of bundle IDs not found under Applications, put back, project cards, and exact copies are specified in `CLEANUP_PRD.md`. Similar photos, memory cleaning, and malware scanning stay out.
+- Uninstalling an app that is still installed. Leftovers, put back, project cards, and exact copies are in the app; the rules are in `CLEANUP_PRD.md`. Similar photos, memory cleaning, and malware scanning stay out.
 - Permanent delete as a default action.
 - Mac App Store distribution (sandboxing blocks the scanning this product needs).
 - Menu bar or background monitoring.
@@ -173,15 +173,16 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 | Xcode DeviceSupport (iOS, watchOS, tvOS, visionOS, macOS) | Preselected | Keep the newest folder per platform |
 | Xcode Archives | Review only | Never preselected |
 | Package manager caches (npm, yarn, pnpm, pip, Cargo registry, Homebrew downloads) | Review only | Owning tool not running |
-| Project build folders (`node_modules` and `dist` next to `package.json`, `target` next to `Cargo.toml`, `.build` next to `Package.swift`) | Review only | At least 10 MB, not modified in 7 days, and not tracked by Git |
+| Project build folders (`node_modules` and `dist` next to `package.json`, `target` next to `Cargo.toml` when it has `CACHEDIR.TAG` or `.rustc_info.json`, `.build` next to `Package.swift`) | Review only | One card per project. At least 10 MB, not modified in 7 days at the top of the folder, and not tracked by Git |
 | `~/Library/Caches/<app>` | Review only | At least 1 MB, owning app not running, never `com.apple.*` |
 | `~/Library/Logs` | Review only | None |
 | Large files (≥ 1 GB) | Review only | Never preselected |
 | Leftover files for a bundle ID not found under Applications | Review only | Caches, Application Support, the container folder, saved application state, and HTTP storage. Not Group Containers, LaunchAgents, Preferences, or `com.apple`. The container folder can be added only with a proof that is checked again when it is added and when it is moved |
+| Exact copies | Review only | Regular files of at least 50 MB with identical contents. The newer file is kept. Only a copy that would free its own space is listed |
 
 Suggestions never overlap: an item claimed by one category is not offered by another.
 
-The next cleanup work (leftovers, put back, one card per project, exact copies) is specified in `CLEANUP_PRD.md`. It does not replace this section.
+Leftovers, put back, one card per project, and exact copies are in the app. The rules are in `CLEANUP_PRD.md`. They do not replace this section.
 
 ### 8.2 Show, but don't clean
 Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` and VM images. Each shows its size and a button that opens the right app or settings pane.
@@ -336,7 +337,7 @@ M3 results (2026-10-05):
 | M3 Cleanup | Suggestions, basket, Will free, Trash, operation log | Will-free test passes; refused paths cannot be added. Done 2026-10-05, see 10.2 |
 | M4 Release 0.1.0 | Onboarding, Full Disk Access flow, settings, ad-hoc signing, DMG, dSYM upload | DMG installs and runs on macOS 14 or later (notarization waits for a Developer ID). Done 2026-10-05: the DMG's app passes `codesign --verify --strict` and runs after being copied out; tested on the development Mac only, not on a clean macOS 14 machine |
 | v1.1 | FSEvents refresh, treemap tab, native crash capture, scan comparison | Done 2026-10-06 as 0.2.0. iCloud, Developer ID signing and notarization stay deferred. |
-| Cleanup next | Leftovers, put back, project cards, exact copies | Leftovers are in the app. Put back, project cards, and exact copies are still specified in `CLEANUP_PRD.md` and not started. |
+| Cleanup next | Leftovers, put back, project cards, exact copies | In the app. Rules remain in `CLEANUP_PRD.md`. |
 | Future: iCloud | "In iCloud, not on this Mac" ring at full logical size, iCloud Drive breakdown, evict and download actions | Separate PRD update |
 
 ## 14. Risks
