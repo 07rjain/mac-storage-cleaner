@@ -328,6 +328,7 @@ impl StorageView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.full_disk_access = Some(check_access());
         self._activation = Some(
             cx.observe_window_activation(window, move |view, window, cx| {
                 if !window.is_window_active() {
@@ -341,8 +342,10 @@ impl StorageView {
                         cx,
                     );
                 }
+                cx.notify();
             }),
         );
+        cx.notify();
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -1535,6 +1538,9 @@ impl StorageView {
             summary.push_str(". ");
             summary.push_str(detail);
         }
+        if self.full_disk_access == Some(false) {
+            summary.push_str(". Full Disk Access is off. Protected folders aren't measured.");
+        }
 
         container
             .id("capacity")
@@ -1592,6 +1598,37 @@ impl StorageView {
                         .text_xs()
                         .text_color(theme.muted)
                         .child(details.join(" · ")),
+                )
+            })
+            .when(self.full_disk_access == Some(false), |this| {
+                let accent = theme.accent;
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .child(
+                            div()
+                                .id("full-disk-access-off")
+                                .role(Role::Label)
+                                .aria_label("Full Disk Access is off")
+                                .text_color(theme.review)
+                                .child(
+                                    "Full Disk Access is off. Protected folders aren't measured.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("full-disk-access-banner")
+                                .role(Role::Link)
+                                .aria_label("Open Full Disk Access settings")
+                                .flex_none()
+                                .text_color(accent)
+                                .cursor_pointer()
+                                .child("Open Settings")
+                                .on_click(|_, _, cx| access::open_settings(cx)),
+                        ),
                 )
             })
             .into_any_element()
@@ -2803,6 +2840,32 @@ mod tests {
             let radius = geometry.inner_radius(segment.ring) + geometry.ring_width / 2.0;
             geometry.point((segment.start + segment.end) / 2.0, radius)
         })
+    }
+
+    #[gpui::test]
+    fn missing_full_disk_access_shows_before_not_measured_is_selected(cx: &mut TestAppContext) {
+        let root = sample_folder();
+        let (view, cx) = open(root.path(), cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.watch_full_disk_access(|| false, window, cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.full_disk_access),
+            Some(false)
+        );
+        assert!(view.read_with(cx, |view, _| view.selected.is_none()));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.watch_full_disk_access(|| true, window, cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.full_disk_access),
+            Some(true)
+        );
     }
 
     #[gpui::test]

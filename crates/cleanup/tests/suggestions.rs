@@ -216,6 +216,30 @@ fn build_folders_are_one_card_per_project() {
     age(&path("rust/ready/target"), 30);
     age(&path("rust/ready/target/debug"), 30);
     age(&path("rust/ready/target/CACHEDIR.TAG"), 30);
+    write(&path("code/site/.next/server/app.js"), 11_000_000);
+    age(&path("code/site/.next"), 30);
+    age(&path("code/site/.next/server"), 30);
+    write(&path("web/turbo-app/package.json"), 20);
+    write(&path("web/turbo-app/.turbo/cache/x"), 11_000_000);
+    age(&path("web/turbo-app/.turbo"), 30);
+    age(&path("web/turbo-app/.turbo/cache"), 30);
+    write(&path("ios/pods-app/Podfile"), 20);
+    write(&path("ios/pods-app/Pods/Alamofire/x"), 11_000_000);
+    age(&path("ios/pods-app/Pods"), 30);
+    age(&path("ios/pods-app/Pods/Alamofire"), 30);
+    write(&path("py/venv-app/pyproject.toml"), 20);
+    write(&path("py/venv-app/.venv/lib/x"), 11_000_000);
+    age(&path("py/venv-app/.venv"), 30);
+    age(&path("py/venv-app/.venv/lib"), 30);
+    write(&path("py/reqs-app/requirements.txt"), 20);
+    write(&path("py/reqs-app/.venv/lib/x"), 11_000_000);
+    age(&path("py/reqs-app/.venv"), 30);
+    age(&path("py/reqs-app/.venv/lib"), 30);
+    write(&path("loose/.next/x"), 11_000_000);
+    age(&path("loose/.next"), 30);
+    write(&path("loose/.venv/lib/x"), 11_000_000);
+    age(&path("loose/.venv"), 30);
+    age(&path("loose/.venv/lib"), 30);
 
     let found = suggestions(
         home.path(),
@@ -242,7 +266,7 @@ fn build_folders_are_one_card_per_project() {
         })
         .collect();
     site_names.sort();
-    assert_eq!(site_names, ["dist", "node_modules"]);
+    assert_eq!(site_names, [".next", "dist", "node_modules"]);
     assert!(site.reason().contains("next build recreates them"));
     assert!(
         site.items[0]
@@ -258,4 +282,96 @@ fn build_folders_are_one_card_per_project() {
             .any(|item| item.path.ends_with("rust/plain/target"))
     }));
     assert!(cards.iter().any(|card| card.title() == "ready"));
+    for title in ["turbo-app", "pods-app", "venv-app", "reqs-app"] {
+        assert!(
+            cards.iter().any(|card| card.title() == title),
+            "missing {title}"
+        );
+    }
+    assert!(cards.iter().all(|card| {
+        !card
+            .items
+            .iter()
+            .any(|item| item.path.ends_with("loose/.next") || item.path.ends_with("loose/.venv"))
+    }));
+}
+
+#[test]
+fn old_screenshots_in_the_screenshot_folder_are_review_only() {
+    let home = tempfile::tempdir().unwrap();
+    let path = |relative: &str| home.path().join(relative);
+    let old = "Screenshot 2020-01-01 at 1.00.00 AM.png";
+    write(&path(&format!("Desktop/{old}")), 250_000);
+    age(&path(&format!("Desktop/{old}")), 30);
+    write(
+        &path("Desktop/Screenshot 2026-10-06 at 1.00.00 AM.png"),
+        250_000,
+    );
+    write(
+        &path("Desktop/Screenshot 2020-02-01 at 1.00.00 AM.png"),
+        1_000,
+    );
+    age(&path("Desktop/Screenshot 2020-02-01 at 1.00.00 AM.png"), 30);
+    write(&path("Desktop/notes.png"), 250_000);
+    age(&path("Desktop/notes.png"), 30);
+    write(
+        &path(&format!("Pictures/Photos Library.photoslibrary/{old}")),
+        250_000,
+    );
+    age(
+        &path(&format!("Pictures/Photos Library.photoslibrary/{old}")),
+        30,
+    );
+
+    let found = suggestions(
+        home.path(),
+        &RunningApps::default(),
+        &Inventory::known(Vec::<String>::new()),
+    );
+    let cards: Vec<_> = found
+        .iter()
+        .filter(|suggestion| suggestion.category == Category::Screenshots)
+        .collect();
+    assert_eq!(cards.len(), 1);
+    assert!(!cards[0].preselected());
+    assert_eq!(cards[0].items.len(), 1);
+    assert!(cards[0].items[0].path.ends_with(format!("Desktop/{old}")));
+}
+
+#[test]
+fn screenshots_use_the_folder_from_screen_capture_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let shots = home.path().join("Pictures/Shots");
+    let plist = home
+        .path()
+        .join("Library/Preferences/com.apple.screencapture.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(
+        &plist,
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>location</key><string>{}</string></dict></plist>"#,
+            shots.display()
+        ),
+    )
+    .unwrap();
+    let name = "Screen Shot 2020-01-01 at 1.00.00 AM.jpg";
+    write(&shots.join(name), 250_000);
+    age(&shots.join(name), 40);
+    write(&home.path().join(format!("Desktop/{name}")), 250_000);
+    age(&home.path().join(format!("Desktop/{name}")), 40);
+
+    let found = suggestions(
+        home.path(),
+        &RunningApps::default(),
+        &Inventory::known(Vec::<String>::new()),
+    );
+    let cards: Vec<_> = found
+        .iter()
+        .filter(|suggestion| suggestion.category == Category::Screenshots)
+        .collect();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].items.len(), 1);
+    assert!(cards[0].items[0].path.starts_with(&shots));
 }

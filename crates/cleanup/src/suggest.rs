@@ -169,6 +169,7 @@ pub fn suggest(
         rules.leftovers(inventory),
         rules.app_caches(),
         rules.logs(),
+        rules.screenshots(),
         rules.large_files(),
     ]);
     suggestions.retain(|suggestion| !suggestion.items.is_empty() || !suggestion.skipped.is_empty());
@@ -543,9 +544,51 @@ impl Rules<'_> {
             Some("Swift build")
         } else if name == "dist" && sibling("package.json") {
             Some("Build output")
+        } else if name == ".next" && sibling("package.json") {
+            Some("Next.js build")
+        } else if name == ".turbo" && sibling("package.json") {
+            Some("Turbo cache")
+        } else if name == "Pods" && sibling("Podfile") {
+            Some("CocoaPods")
+        } else if name == ".venv" && (sibling("pyproject.toml") || sibling("requirements.txt")) {
+            Some("Python environment")
         } else {
             None
         }
+    }
+
+    /// Screenshots in the folder from Screen Capture settings, or the Desktop when that
+    /// setting is missing. Only the files in that folder are considered.
+    fn screenshots(&mut self) -> Suggestion {
+        const AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+        const MIN_SIZE: u64 = 200_000;
+        let folder = screenshot_folder(&self.places.home);
+        let path = Places::tree_path(self.tree.root_path(), &folder);
+        let Some(root) = self.tree.find(&path) else {
+            return self.finish(Category::Screenshots, Vec::new(), Vec::new());
+        };
+        let mut items = Vec::new();
+        for child in self.tree.children(root) {
+            if self.tree.kind(child) != NodeKind::File || !is_screenshot_name(self.tree.name(child))
+            {
+                continue;
+            }
+            if self.tree.allocated(child) < MIN_SIZE || !self.usable(child) {
+                continue;
+            }
+            let path = self.user_path(child);
+            let Some(age) = self.age(&path).filter(|age| *age >= AGE) else {
+                continue;
+            };
+            items.push(self.candidate(child, Some(age_note(age))));
+        }
+        items.sort_by_key(|item| std::cmp::Reverse(item.size));
+        let mut skipped = Vec::new();
+        if items.len() > MAX_ITEMS {
+            skipped.push("The list was cut.".into());
+            items.truncate(MAX_ITEMS);
+        }
+        self.finish(Category::Screenshots, items, skipped)
     }
 
     /// The nearest folder above `id` with a `.git` inside, as a user path.
@@ -755,6 +798,47 @@ fn bundle_id_of(name: &OsStr, saved_state: bool) -> Option<String> {
         name
     };
     crate::inventory::is_bundle_id(bundle_id).then(|| bundle_id.to_string())
+}
+
+/// The folder Screen Capture writes to. A missing file or a missing `location` key means
+/// the Desktop. The key is read from this home folder, not from the signed-in user's defaults.
+fn screenshot_folder(home: &Path) -> PathBuf {
+    let plist = home.join("Library/Preferences/com.apple.screencapture.plist");
+    if plist.is_file()
+        && let Some(location) = read_plist_string(&plist, "location")
+    {
+        let path = PathBuf::from(location);
+        if path.is_absolute() {
+            return path;
+        }
+    }
+    home.join("Desktop")
+}
+
+fn read_plist_string(plist: &Path, key: &str) -> Option<String> {
+    let path = plist.to_str()?;
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", key, "raw", "-o", "-"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn is_screenshot_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    (name.starts_with("Screenshot ") || name.starts_with("Screen Shot "))
+        && has_extension(
+            OsStr::new(name),
+            &["png", "jpg", "jpeg", "heic", "tiff", "tif"],
+        )
 }
 
 fn has_extension(name: &OsStr, extensions: &[&str]) -> bool {

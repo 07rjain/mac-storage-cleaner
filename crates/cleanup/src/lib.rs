@@ -43,6 +43,8 @@ pub enum Category {
     Leftovers,
     /// An older exact copy whose removal would free private space.
     ExactCopies,
+    /// Old screenshots in the folder Screen Capture uses.
+    Screenshots,
     /// Added by the user from the chart or the list.
     Chosen,
 }
@@ -67,6 +69,7 @@ impl Category {
             Self::LargeFiles => "Large files",
             Self::Leftovers => "Leftover files not tied to an installed app",
             Self::ExactCopies => "Exact copies",
+            Self::Screenshots => "Screenshots",
             Self::Chosen => "Chosen by you",
         }
     }
@@ -98,6 +101,9 @@ impl Category {
             }
             Self::ExactCopies => {
                 "Identical files. Only a copy that would free its own space is listed"
+            }
+            Self::Screenshots => {
+                "Screenshots in the screenshot folder, untouched for 30 days. Check each one"
             }
             Self::Chosen => "Items you added",
         }

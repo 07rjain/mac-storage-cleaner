@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-07
+
+### Added
+
+- Old screenshots in the screenshot folder are a review-only card. The folder is the one in Screen Capture settings, or the Desktop when that setting is missing.
+- Exact copies are one card per file type, such as Exact copies · Videos.
+- Project cards also include `.next` and `.turbo` next to `package.json`, `Pods` next to a `Podfile`, and `.venv` next to `pyproject.toml` or `requirements.txt`.
+
+### Fixed
+
+- The main window says Full Disk Access is off, and links to its settings, without selecting "Not measured" first.
+
 ## [0.2.6] - 2026-10-06
 
 ### Added

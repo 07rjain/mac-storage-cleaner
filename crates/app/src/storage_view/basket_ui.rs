@@ -21,6 +21,7 @@ use gpui::{
 use scanner::{Measurement, NodeFlags, NodeId};
 
 use super::{StorageView, display_path};
+use crate::file_types::FileType;
 use crate::format;
 use crate::model::Item;
 use crate::theme::Theme;
@@ -670,13 +671,7 @@ impl StorageView {
     fn set_copies(&mut self, items: Vec<cleanup::Candidate>, skipped: Vec<String>) {
         let mut suggestions = (*self.cleanup.suggestions).clone();
         suggestions.retain(|suggestion| suggestion.category != Category::ExactCopies);
-        suggestions.push(Suggestion {
-            category: Category::ExactCopies,
-            items,
-            skipped,
-            title_override: None,
-            reason_override: None,
-        });
+        suggestions.extend(exact_copy_cards(items, skipped));
         self.cleanup.suggestions = Rc::new(suggestions);
     }
 
@@ -2195,6 +2190,48 @@ fn sheet_row(
         )
 }
 
+/// One exact-copy card per file type. An empty result stays a single "Exact copies" card so
+/// progress and "Nothing to remove" still have a place to show.
+fn exact_copy_cards(items: Vec<cleanup::Candidate>, skipped: Vec<String>) -> Vec<Suggestion> {
+    if items.is_empty() {
+        return vec![Suggestion {
+            category: Category::ExactCopies,
+            items,
+            skipped,
+            title_override: None,
+            reason_override: None,
+        }];
+    }
+    let mut groups: Vec<(FileType, Vec<cleanup::Candidate>)> = Vec::new();
+    for item in items {
+        let kind = item
+            .path
+            .file_name()
+            .map(FileType::of_file)
+            .unwrap_or(FileType::Other);
+        if let Some((_, bucket)) = groups.iter_mut().find(|(existing, _)| *existing == kind) {
+            bucket.push(item);
+        } else {
+            groups.push((kind, vec![item]));
+        }
+    }
+    let mut cards: Vec<Suggestion> = groups
+        .into_iter()
+        .map(|(kind, items)| Suggestion {
+            category: Category::ExactCopies,
+            items,
+            skipped: Vec::new(),
+            title_override: Some(format!("Exact copies · {}", kind.title())),
+            reason_override: None,
+        })
+        .collect();
+    cards.sort_by_key(|card| std::cmp::Reverse(card.size()));
+    if let Some(first) = cards.first_mut() {
+        first.skipped = skipped;
+    }
+    cards
+}
+
 /// Local date and time, for example "2026-10-05 14:03".
 fn format_time(seconds: u64) -> String {
     let time = seconds as libc::time_t;
@@ -2252,5 +2289,40 @@ mod tests {
         assert_eq!(trash_size(&outcome(vec![moved(None)])), None);
         let unreadable = outcome(vec![moved(Some(PathBuf::from("/nonexistent/.Trash/x")))]);
         assert_eq!(trash_size(&unreadable), None);
+    }
+
+    fn copy_candidate(path: &str, size: u64) -> cleanup::Candidate {
+        cleanup::Candidate {
+            node: 1,
+            path: PathBuf::from(path),
+            size,
+            note: None,
+            proof: None,
+            copy: None,
+        }
+    }
+
+    #[test]
+    fn exact_copies_are_one_card_per_file_type() {
+        let cards = exact_copy_cards(
+            vec![
+                copy_candidate("/clips/old.mp4", 60_000_000),
+                copy_candidate("/clips/older.mov", 60_000_000),
+                copy_candidate("/pics/scan.jpg", 80_000_000),
+            ],
+            vec!["The search stopped early.".into()],
+        );
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].title(), "Exact copies · Videos");
+        assert_eq!(cards[0].items.len(), 2);
+        assert_eq!(cards[0].skipped, ["The search stopped early."]);
+        assert_eq!(cards[1].title(), "Exact copies · Images");
+        assert!(cards[1].skipped.is_empty());
+        assert!(cards.iter().all(|card| !card.preselected()));
+
+        let empty = exact_copy_cards(Vec::new(), vec!["Nothing to remove".into()]);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].title(), "Exact copies");
+        assert!(empty[0].items.is_empty());
     }
 }

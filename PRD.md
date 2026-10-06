@@ -99,7 +99,7 @@ Licensing rules:
 - **Icicle:** the same levels as the sunburst, drawn as horizontal bars. The top bar is the current folder and goes up. ⌥⌘3.
 - **Tree:** an outline of the current folder. The arrow, or the Right arrow key, expands a folder without leaving it; Right arrow again opens it. Folders with more than 8,000 entries open instead of expanding. ⌥⌘4.
 - **File types:** bars of space by file kind inside the current folder. The largest child folders are opened one level; the rest stay in one Folders bar. ⌥⌘5.
-- **Accounting slices at the root:** other APFS volumes, purgeable space, local snapshots, and "Not measured" (protected or unreadable areas). The "Not measured" slice offers the Full Disk Access prompt.
+- **Accounting slices at the root:** other APFS volumes, purgeable space, local snapshots, and "Not measured" (protected or unreadable areas). When Full Disk Access is off, the capacity bar says so and links to its settings. Selecting "Not measured" still offers that prompt.
 - **Files stored only in iCloud** count at their local size, which is close to zero. A separate iCloud view is deferred to Future.
 - **Side list:** the children of the current folder, sorted by size, kept in sync with the chart on hover and selection. After a later scan of the same place, folders that grew or shrank by at least 1 MB show a note, and the status bar shows the total change since last scan.
 - **Breadcrumb:** the path, with a dropdown on each segment for jumping to sibling folders.
@@ -155,7 +155,7 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 - "Not measured" = container used space − (scanned bytes + other volumes + purgeable). Never shown as negative; any mismatch is logged.
 
 ### 7.6 Permissions
-- Full Disk Access is detected by checking whether a TCC-protected path can be opened (`~/Library/Application Support/com.apple.TCC/TCC.db`, or `~/Library/Safari` if that file doesn't exist; heuristic used by disktree). It is re-checked whenever the welcome, settings or main window comes to the front.
+- Full Disk Access is detected by checking whether a TCC-protected path can be opened (`~/Library/Application Support/com.apple.TCC/TCC.db`, or `~/Library/Safari` if that file doesn't exist; heuristic used by disktree). The main window checks when it opens, and the welcome, settings and main windows check again when they come to the front.
 - Folders that return `EPERM` or `EACCES` are shown as "Not measured", never as 0 bytes.
 
 ### 7.7 Refresh
@@ -173,16 +173,17 @@ Cards labelled "Safe to delete" or "Review first", each with a size and item cou
 | Xcode DeviceSupport (iOS, watchOS, tvOS, visionOS, macOS) | Preselected | Keep the newest folder per platform |
 | Xcode Archives | Review only | Never preselected |
 | Package manager caches (npm, yarn, pnpm, pip, Cargo registry, Homebrew downloads) | Review only | Owning tool not running |
-| Project build folders (`node_modules` and `dist` next to `package.json`, `target` next to `Cargo.toml` when it has `CACHEDIR.TAG` or `.rustc_info.json`, `.build` next to `Package.swift`) | Review only | One card per project. At least 10 MB, not modified in 7 days at the top of the folder, and not tracked by Git |
+| Project build folders (`node_modules`, `dist`, `.next`, and `.turbo` next to `package.json`, `Pods` next to a `Podfile`, `.venv` next to `pyproject.toml` or `requirements.txt`, `target` next to `Cargo.toml` when it has `CACHEDIR.TAG` or `.rustc_info.json`, `.build` next to `Package.swift`) | Review only | One card per project. At least 10 MB, not modified in 7 days at the top of the folder, and not tracked by Git |
 | `~/Library/Caches/<app>` | Review only | At least 1 MB, owning app not running, never `com.apple.*` |
 | `~/Library/Logs` | Review only | None |
-| Large files (≥ 1 GB) | Review only | Never preselected |
+| Screenshots | Review only | The folder in Screen Capture settings, or the Desktop when that setting is missing. Names starting with `Screenshot ` or `Screen Shot `, png/jpg/heic/tiff, untouched for 30 days, at least 200 KB. At most 50. The Photos library is not searched |
+| Large files (≥ 1 GB) | Review only | Never preselected. A path already claimed by another suggestion is left out |
 | Leftover files for a bundle ID not found under Applications | Review only | Caches, Application Support, the container folder, saved application state, and HTTP storage. Not Group Containers, LaunchAgents, Preferences, or `com.apple`. The container folder can be added only with a proof that is checked again when it is added and when it is moved |
-| Exact copies | Review only | Regular files of at least 50 MB with identical contents. The newer file is kept. Only a copy that would free its own space is listed |
+| Exact copies | Review only | Regular files of at least 50 MB with identical contents. The newer file is kept. Only a copy that would free its own space is listed. Finished results are one card per file type, such as `Exact copies · Videos` |
 
 Suggestions never overlap: an item claimed by one category is not offered by another.
 
-Leftovers, put back, one card per project, and exact copies are in the app. The rules are in `CLEANUP_PRD.md`. They do not replace this section.
+Leftovers, put back, one card per project, exact copies, screenshots, and the extra project folders are in the app. The rules are in `CLEANUP_PRD.md`. They do not replace this section.
 
 ### 8.2 Show, but don't clean
 Photos library, iOS backups, Mail downloads, Messages attachments, `Docker.raw` and VM images. Each shows its size and a button that opens the right app or settings pane.

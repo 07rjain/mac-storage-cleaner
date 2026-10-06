@@ -265,6 +265,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("Library/Caches/app")).unwrap();
         std::fs::create_dir_all(home.path().join("Downloads")).unwrap();
+        std::fs::create_dir_all(home.path().join("Pictures/Photos Library.photoslibrary")).unwrap();
+        std::fs::create_dir_all(
+            home.path()
+                .join("Library/Containers/com.apple.mail/Data/Library/Mail Downloads"),
+        )
+        .unwrap();
         let mut basket = basket(home.path());
 
         for (path, refusal) in [
@@ -278,6 +284,15 @@ mod tests {
                 Refusal::Applications,
             ),
             (home.path().join("Downloads/missing.dmg"), Refusal::Missing),
+            (
+                home.path().join("Pictures/Photos Library.photoslibrary"),
+                Refusal::ManagedByApp,
+            ),
+            (
+                home.path()
+                    .join("Library/Containers/com.apple.mail/Data/Library/Mail Downloads"),
+                Refusal::ManagedByApp,
+            ),
         ] {
             assert_eq!(
                 basket.add(&path, None, Category::Chosen, 1),

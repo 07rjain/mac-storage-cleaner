@@ -2,7 +2,7 @@
 
 Status: Draft · Owner: Rishabh · Date: 2026-10-06 · Revised after review `task_1313eb8f-e01c-442f-a4f7-308e723f4f4b`
 
-Leftovers (section 5), put back (section 6), project cards (section 7), and exact copies (section 8) are in the app.
+Leftovers (section 5), put back (section 6), project cards (section 7), and exact copies (section 8) are in the app. Screenshots and the extra project folders in section 7 are in the app as well. Mail downloads and the Photos library stay show-only.
 
 This is the spec for the next cleanup work. The product PRD (`PRD.md`) still governs scanning, charts, Sentry, and the v1 cleanup that already shipped. Where this document is silent, those rules stand. Section 5.3 narrows a refusal in `PRD.md` section 8.3: one proven leftover container, rechecked when it is added and when it is moved.
 
@@ -56,7 +56,9 @@ These behaviors stay. This spec extends them.
 
 Build folders today (`suggest.rs`):
 
-- `node_modules` or `dist` next to `package.json`
+- `node_modules`, `dist`, `.next`, or `.turbo` next to `package.json`
+- `Pods` next to a `Podfile`
+- `.venv` next to `pyproject.toml` or `requirements.txt`
 - `target` next to `Cargo.toml`, and only when `CACHEDIR.TAG` or `.rustc_info.json` is inside `target`
 - `.build` next to `Package.swift`
 - At least 10 MB
@@ -237,9 +239,9 @@ Empty Trash deletes only items this app moved that are still `trashed`. It uses 
 
 ## 7. One card per project
 
-This does not make more folders eligible and does not add a running-tool check. It changes how build folders that already pass section 3 are shown.
+`.next`, `.turbo`, `Pods`, and `.venv` are eligible under the same size, age, and Git gates as the folders in section 3. There is still no running-tool check.
 
-Group those items by the directory that holds the manifest (`package.json`, `Cargo.toml`, or `Package.swift`). The card's identity is that directory's full path. The title is the folder name. When two cards would show the same name, the title includes the parent folder.
+Group those items by the directory that holds the manifest (`package.json`, `Cargo.toml`, `Package.swift`, `Podfile`, `pyproject.toml`, or `requirements.txt`). The card's identity is that directory's full path. The title is the folder name. When two cards would show the same name, the title includes the parent folder.
 
 - Reason: "Dependencies and build output in this project, untouched for 7 days at the top of the folder and not in Git. The next build recreates them."
 - The reason does not say every file inside was untouched.
@@ -284,7 +286,7 @@ Before the move, recheck both the copy and the kept file. Refuse the move when:
 - the kept file is in the basket, or inside a folder in the basket
 - the copy is inside a folder already being removed
 
-One card, "Exact copies". Review-only. Each row shows both paths, the private bytes that would be freed, and "Identical contents. The newer file is kept." or the same-date line.
+One review-only card per file type, titled `Exact copies · Videos` and so on. A type with no copies produces no card. While the search is running, and when it finishes with nothing to remove, there is still a single Exact copies card for the progress line or the empty result. Each row shows both paths, the private bytes that would be freed, and "Identical contents. The newer file is kept." or the same-date line.
 
 The card shows progress while hashing. It says when it stopped because of the file cap, the byte cap, the time cap, or Stop. "Nothing to remove" is only for a finished search that found nothing. A capped search says it was incomplete.
 
@@ -314,13 +316,15 @@ Fixtures are temporary directories. Tests that mount a disk or scan the home fol
 | `/Applications` unreadable | No leftovers card. The status says the app list could not be read. |
 | `com.apple` and MobileSync | Not suggested. Adding them still fails. |
 | Managed file inside a container | The container is not suggested and cannot be added. |
+| Mail and Photos | Mail Downloads and a Photos library are shown and open their app. Neither can be added to the basket. |
 | Stale proof | A reinstall, a new inventory generation, or a changed identity refuses the move. |
 | History put back | An item this app trashed returns to its original path. An occupied destination is left alone. An old log row without an item record has no Put back button. A restored item is not deleted by Empty Trash. |
 | Partial restore | One failure does not cancel the items that succeeded, and the failed item can be tried again. |
 | Log append failed | The result says Put back is unavailable. It does not offer a button that cannot find the Trash URL. |
-| Project card | `node_modules` and `dist` of one project are one card, identified by the full project path. A Cargo `target` without `CACHEDIR.TAG` or `.rustc_info.json` is not on it. Two projects with the same folder name show a parent in the title. |
+| Project card | `node_modules`, `dist`, and `.next` of one project are one card. `.turbo`, `Pods`, and `.venv` join the project that holds their manifest. A Cargo `target` without `CACHEDIR.TAG` or `.rustc_info.json` is not on a card. Two projects with the same folder name show a parent in the title. |
+| Screenshots | A screenshot on the Desktop untouched for 30 days, at least 200 KB, is one review-only row. A screenshot from today is not. The same name inside a Photos library is not. A custom Screen Capture folder is used when that setting is present. |
 | Clone | Two clones of a 100 MB file produce no duplicate row. |
-| Real copy | Two independent 100 MB files with the same bytes produce one row, the older file, and Will free for that row is at least 50 MB. |
+| Real copy | Two independent 100 MB files with the same bytes produce one row, the older file, and Will free for that row is at least 50 MB. Finished copies are one card per file type. |
 | Copy changed after hash | The move is refused. |
 | Kept file in the basket | The duplicate move is refused. |
 | Dataless file | It is not read and not suggested. |
