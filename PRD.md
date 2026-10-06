@@ -322,7 +322,7 @@ M3 results (2026-10-05):
 - `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with [Semantic Versioning](https://semver.org/).
 - Every change that affects users, dependencies, the GPUI pin, Sentry setup or safety rules adds a line under `## [Unreleased]`.
 - A release moves `Unreleased` into a dated version section. The same version is used for the app bundle and the Sentry release.
-- The app's About window shows the version and opens the changelog, license and notices bundled in the app.
+- The app's About window shows the version and opens the changelog, license and notices bundled in the app. Check for Updates downloads a newer release and replaces the installed app.
 - Release steps: `scripts/bundle.sh` (app bundle, ad hoc signature, DMG and dSYM in `dist/`), then `scripts/upload-dsym.sh` (Sentry release and debug symbols), then a Git tag `v<version>` and a GitHub release with the DMG.
 - `THIRD_PARTY_NOTICES.md` is updated in the same change as any copied or adapted MIT or Apache code.
 

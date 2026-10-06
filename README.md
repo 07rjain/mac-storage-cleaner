@@ -12,6 +12,7 @@ Apple silicon, macOS 14 or later.
 2. Open the disk image and drag **Mac Storage Cleaner** to Applications.
 3. The app is signed ad hoc and not notarized. On first launch, right-click the app and choose **Open**, or use System Settings › Privacy & Security › **Open Anyway**.
 4. Grant Full Disk Access when asked if you want protected folders measured. Each ad-hoc build looks like a new app to macOS, so access has to be granted again after updating.
+5. After that, Check for Updates downloads the next version and replaces the app.
 
 ## What it does
 

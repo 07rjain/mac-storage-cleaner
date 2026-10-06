@@ -233,7 +233,7 @@ fn open_about_window(check: bool, cx: &mut App) {
     }
     let options = window_options(
         &format!("About {APP_NAME}"),
-        size(px(480.), px(320.)),
+        size(px(480.), px(360.)),
         false,
         cx,
     );

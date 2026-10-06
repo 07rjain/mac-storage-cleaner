@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/app", "crates/cleanup", "crates/scan-cli", "crates/scanner", "crates/telemetry", "crates/volumes"]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "MIT"
 rust-version = "1.99"

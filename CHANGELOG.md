@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-06
+
+### Changed
+
+- Check for Updates downloads the new version, replaces this app, and reopens it. Full Disk Access has to be granted again. A copy opened from the disk image is installed into Applications.
+
 ## [0.2.4] - 2026-10-06
 
 ### Added

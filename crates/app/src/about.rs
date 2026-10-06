@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use gpui::{Context, FontWeight, IntoElement, Render, SharedString, Task, Window, div, prelude::*};
 
@@ -20,6 +21,7 @@ enum Check {
     Checking,
     UpToDate,
     Available(Release),
+    Installing(Release),
     Failed(SharedString),
 }
 
@@ -32,7 +34,7 @@ impl About {
     }
 
     pub fn check(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, Check::Checking) {
+        if matches!(self.state, Check::Checking | Check::Installing(_)) {
             return;
         }
         self.state = Check::Checking;
@@ -50,6 +52,34 @@ impl About {
                     Err(message) => Check::Failed(message.into()),
                 };
                 cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn install(&mut self, cx: &mut Context<Self>) {
+        let Check::Available(release) = &self.state else {
+            return;
+        };
+        let Some(url) = release.dmg.clone() else {
+            return;
+        };
+        let version = release.version.clone();
+        self.state = Check::Installing(release.clone());
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { update::install_update(&url, &version) })
+                .await;
+            let _ = this.update(cx, |about, cx| match result {
+                Ok(()) => {
+                    telemetry::flush(Duration::from_secs(2));
+                    cx.quit();
+                }
+                Err(message) => {
+                    about.state = Check::Failed(message.into());
+                    cx.notify();
+                }
             });
         }));
         cx.notify();
@@ -80,15 +110,6 @@ fn open_document(name: &str) {
     }
 }
 
-fn open_url(url: &str) {
-    if !update::is_release_url(url) {
-        return;
-    }
-    if let Err(error) = Command::new("/usr/bin/open").arg(url).spawn() {
-        tracing::warn!("couldn't open the release: {error}");
-    }
-}
-
 impl Render for About {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
@@ -103,10 +124,14 @@ impl Render for About {
             Check::Checking => format!("Version {VERSION} · Checking…"),
             Check::UpToDate => format!("Version {VERSION} is the latest."),
             Check::Available(release) => format!("Version {} is available.", release.version),
+            Check::Installing(release) => format!("Installing version {}…", release.version),
             Check::Failed(message) => format!("Version {VERSION} · {message}"),
         };
-        let download = match &self.state {
-            Check::Available(release) => release.dmg.clone().or_else(|| Some(release.page.clone())),
+        let updating = matches!(self.state, Check::Installing(_));
+        let update = match &self.state {
+            Check::Available(release) | Check::Installing(release) if release.dmg.is_some() => {
+                Some(())
+            }
             _ => None,
         };
 
@@ -154,19 +179,28 @@ impl Render for About {
                             },
                         ))
                     })
-                    .when_some(download, |this, url| {
+                    .when_some(update, |this, _| {
                         let color = theme.accent_fill;
+                        let label = if updating { "Updating…" } else { "Update" };
                         this.child(
-                            primary_button("download-update", "Download Update", color, true)
-                                .on_click(move |_, _, _| open_url(&url)),
+                            primary_button("install-update", label, color, !updating).when(
+                                !updating,
+                                |this| {
+                                    this.on_click(cx.listener(|this, _, _, cx| {
+                                        this.install(cx);
+                                    }))
+                                },
+                            ),
                         )
                     }),
             )
-            .when(matches!(self.state, Check::Available(_)), |this| {
+            .when(
+                matches!(self.state, Check::Available(_) | Check::Installing(_)),
+                |this| {
                 this.child(
                     label(
                         "update-hint",
-                        "Opens the disk image. Drag the app to Applications and replace the old one. Full Disk Access may need to be granted again.",
+                        "Replaces this app and reopens it. Full Disk Access has to be granted again.",
                     )
                     .text_center()
                     .text_xs()
